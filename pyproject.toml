@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handoff-recovery"
+version = "0.1.0"
+description = "Independent prototype for GUI recovery after user handoff"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+gui-owl = ["openai>=1.0", "Pillow>=10"]
+cloud-agents = ["Pillow>=10", "httpx>=0.27", "openai>=1.0", "python-dotenv>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"handoff_recovery.planner" = ["system_prompt.txt"]

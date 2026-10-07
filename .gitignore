@@ -1,0 +1,38 @@
+# Local credentials and overrides
+.env
+.env.*
+!.env.example
+configs/*.local.json
+configs/local/
+
+# Python / editors / build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+
+# Local runtime, outputs and model assets
+.runtime/
+.cache/
+artifacts/
+results/*
+!results/README.md
+models/
+local-models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.apk
+*.log
