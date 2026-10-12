@@ -65,6 +65,11 @@ def parse_args(argv=None):
     parser.add_argument("--planner-endpoint", help="Exact full Chat Completions URL (takeover only)")
     parser.add_argument("--planner-model")
     parser.add_argument("--planner-disable-thinking", action="store_true")
+    parser.add_argument(
+        "--compact-environment-result",
+        action="store_true",
+        help="Compact the sealed environment result into the host journal before the task directory is removed",
+    )
     parser.add_argument("--planner-adapter", default="openai_compatible",
                         help="Planner registry name or module:factory path")
     parser.add_argument("--planner-response-format", choices=("json_schema", "none"),
@@ -83,7 +88,7 @@ def parse_args(argv=None):
     parser.add_argument("--local-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--local-total-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--local-proxy-mode", default="environment")
-    parser.add_argument("--local-max-output-tokens", type=int, default=2048)
+    parser.add_argument("--local-max-output-tokens", type=int, default=4096)
     parser.add_argument("--local-prompt-path", type=Path,
                         help="PhoneBuddy pinned prompt path (optional)")
     parser.add_argument("--disable-structured-progress", action="store_true",
@@ -307,6 +312,13 @@ def main(argv=None):
                 descriptor = getattr(executor, "descriptor", None)
                 if isinstance(descriptor, dict):
                     summary["executor"]["descriptor"] = descriptor
+                    # Cloud adapters resolve model and endpoint from the
+                    # selected HandoffBench provider configuration. Mirror
+                    # that authoritative metadata in the run summary.
+                    if descriptor.get("configuration_source", "").startswith("handoffbench"):
+                        summary["executor"]["model"] = descriptor.get("model")
+                        summary["executor"]["base_url_host"] = descriptor.get("base_url_host")
+                        summary["executor"]["configuration_source"] = descriptor["configuration_source"]
                     write(output / "summary.json", summary)
                 agent = HandoffRecoveryAgent(
                     bench_path=bench, planner=planner, executor=executor,
@@ -391,6 +403,15 @@ def main(argv=None):
                 write(case / "smoke.json", item)
                 if active:
                     manager.seal_result(item, evidence_paths=[case])
+                    if args.compact_environment_result:
+                        # The environment journal is bounded. Reuse the same
+                        # compact trial projection as HandoffBench instead of
+                        # writing recovery history and raw evidence metadata.
+                        from resumebench.batch.retention import compact_trial
+                        receipt = manager.compact_result(compact_trial(item))
+                        compact_marker = case / "environment/compact-result-receipt.json"
+                        compact_marker.parent.mkdir(parents=True, exist_ok=True)
+                        write(compact_marker, receipt)
                 write(output / "summary.json", summary)
             print(f"Instance {number}: {item['status']}", flush=True)
             if item["status"] == "error":

@@ -8,7 +8,8 @@
 
 批量入口支持 `--planner-model` 临时覆盖 `.env` 中的 Planner 模型，便于在不复制凭据的情况下进行模型 A/B 实验；支持 `--max-decisions` 或 `RECOVERY_MAX_DECISIONS` 配置共享 GUI 决策预算。并行运行时必须为每个进程指定独立的 `--device`、`--appium-url` 和结果根目录。
 
-`run_recovery_batch.py` 面向 HandoffRecovery 的正式恢复实验，模式固定为 `takeover`。它只接受稳定的 HandoffBench `task_id`，或者使用 `--all` 选择全部活动任务；public instance 编号仅在内部转换并写入结果元数据。
+`run_recovery_batch.py` 面向 HandoffRecovery 的正式恢复实验，模式固定为 `takeover`。它只接受稳定的 HandoffBench `task_id`，或者使用 `--all` 选择全部活动任务；public instance 编号仅在内部转换并写入结果元数据。结果保留策略为 `detailed`（完整任务目录）、`compact`（删除 preparation/restore）或 `summary`（任务结束后删除整个任务目录，只保留批次级摘要和报告）。
+每个批次目录还会保存 `run.log`。批处理入口会将任务子进程输出同时写入该日志和标准输出；在 tmux 中启动时不要使用 `> log 2>&1` 重定向，这样窗口可以实时显示进度，日志仍会保存在对应批次目录内。
 
 逐项 `completion_check` 的小范围消融实验使用 `--disable-completion-check` 作为控制组开关。控制组会同时去掉 PhoneBuddy 恢复提示中的该要求，并关闭 Coordinator 的强制校验；实验组省略该开关。两组必须使用独立的本地模型服务、Android serial、Appium URL 和结果目录。Planner 云端端点可以相同，但每个批次仍应使用独立结果目录。
 
@@ -122,10 +123,10 @@ PYTHONPATH=src python3 scripts/run_recovery_batch.py \
 PYTHONPATH=src python3 scripts/run_recovery_batch.py --all
 ```
 
-结果目录格式为：
+结果目录格式为（`id` 为 UTC 时间戳和随机短 ID）：
 
 ```text
-results/<planner_model>_<local_model>_<task_count>_<run_id>/
+results/<planner_model>_<gui_agent_model>_<task_count>_<budget_steps>_<id>/
 ```
 
 恢复方案开发阶段默认使用 `RECOVERY_RESULT_RETENTION=detailed`，每个任务保留独立诊断目录；方案稳定后可改为 `compact`，删除 preparation 和 restore 等大体积生命周期证据，只保留汇总、任务结果和恢复诊断。HandoffBench 的 preparation、Runner、takeover 注入、预算和评分仍由原公共实现负责。

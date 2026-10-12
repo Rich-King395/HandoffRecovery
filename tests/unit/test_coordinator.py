@@ -39,6 +39,7 @@ def execute_reply(**kwargs):
             CONSTRAINTS,
             ("The contact details visibly show the requested saved email.",),
         ),
+        use_prior_progress=True,
     ), **kwargs)
 
 
@@ -174,8 +175,30 @@ class CoordinatorTests(unittest.TestCase):
         result = coordinator.step(frame("execution_1"))
         self.assertEqual(result.kind, "action")
         self.assertEqual(executor.requests[-1][1].prior_progress,
-                         ("decision 1: tap on prefix_0",))
+                         {
+                             "purpose": "orientation_only",
+                             "reliability": "unverified",
+                             "current_state_source": "latest_screenshot",
+                             "attempt_summary": {
+                                 "decision_count": 1,
+                                 "action_types_attempted": ["tap"],
+                             },
+                             "interpretation_rule": (
+                                 "These are attempted actions only. They do not prove that any action "
+                                 "succeeded or describe the current UI state."
+                             ),
+                         })
         coordinator.acknowledge_action(success=True)
+
+    def test_execution_omits_prior_progress_without_planner_opt_in(self):
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "tap", "coords": [1, 1]}, {"action": "wait"}],
+            [slim_execute_reply()])
+        self.run_prefix(coordinator, 1)
+        self.return_control(coordinator)
+        result = coordinator.step(frame("execution_without_progress"))
+        self.assertEqual(result.kind, "action")
+        self.assertIsNone(executor.requests[-1][1].prior_progress)
 
     def test_repeated_unchanged_actions_remain_executor_responsibility(self):
         coordinator, _, _ = self.make_coordinator(
@@ -499,6 +522,18 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(len(executor.requests), 30)
         self.assertEqual(planner.requests, [])
         self.assertEqual(coordinator.report()["budget"]["total"], 30)
+        semantics = coordinator.report()["budget_semantics"]
+        self.assertEqual(semantics["version"], "shared_total_v1")
+        self.assertEqual(semantics["planner_calls"],
+                         "separate_preparation_counter_not_gui_decisions")
+        self.assertTrue(semantics["verification"].startswith("verification_actions"))
+
+    def test_executor_protocol_error_is_classified_separately_from_recovery_control(self):
+        coordinator, planner, executor = self.make_coordinator(
+            [RuntimeError("provider output")])
+        result = coordinator.step(frame("protocol_error"))
+        self.assertEqual(result.error_class, "gui_agent_error")
+        self.assertEqual(coordinator.report()["error_class"], "gui_agent_error")
 
     def test_local_error_or_malformed_action_on_twentieth_decision_is_counted(self):
         for bad_action in (RuntimeError("private agent error body"), {"action": "unsupported"},

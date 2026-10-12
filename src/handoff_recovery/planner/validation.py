@@ -126,7 +126,12 @@ def _handoff(value: Any) -> Handoff:
 
 
 def _parse(value: Any, request: PlanRequest) -> Plan:
-    value = _fields(value, {"decision", "reason", "facts", "unknowns", "verification", "handoff"})
+    allowed = {"decision", "reason", "facts", "unknowns", "verification", "handoff",
+               "use_prior_progress"}
+    required = {"decision", "reason", "facts", "unknowns", "verification", "handoff"}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or not set(value) <= allowed):
+        raise PlanValidationError("Missing, unexpected, or invalid object fields")
     decision = _text(value["decision"])
     if decision not in {"VERIFY", "EXECUTE", "FALLBACK"}:
         raise PlanValidationError("Unsupported planner decision")
@@ -183,12 +188,21 @@ def _parse(value: Any, request: PlanRequest) -> Plan:
         handoff = _handoff(value["handoff"])
     elif value["verification"] is not None or value["handoff"] is not None:
         raise PlanValidationError("FALLBACK cannot supply new instructions")
-    return Plan(decision, reason, tuple(facts), tuple(unknowns), verification, handoff)
+    use_prior_progress = value.get("use_prior_progress", False)
+    if type(use_prior_progress) is not bool:
+        raise PlanValidationError("Missing, unexpected, or invalid object fields")
+    return Plan(decision, reason, tuple(facts), tuple(unknowns), verification, handoff,
+                use_prior_progress)
 
 
 def _parse_slim(value: Any, request: PlanRequest) -> SlimPlan:
     """Parse the minimal cloud contract; evidence and branch semantics stay local."""
-    value = _fields(value, {"decision", "objective", "completion_conditions", "constraints"})
+    allowed = {"decision", "objective", "completion_conditions", "constraints",
+               "use_prior_progress"}
+    required = {"decision", "objective", "completion_conditions", "constraints"}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or not set(value) <= allowed):
+        raise PlanValidationError("Missing, unexpected, or invalid object fields")
     decision = _text(value["decision"])
     if decision not in {"VERIFY", "EXECUTE", "FALLBACK"}:
         raise PlanValidationError("Unsupported planner decision")
@@ -202,7 +216,10 @@ def _parse_slim(value: Any, request: PlanRequest) -> SlimPlan:
             or request.cloud_calls_remaining_after_this < 1
             or request.decisions_remaining < 2):
         raise PlanValidationError("Insufficient remaining verification budget")
-    return SlimPlan(decision, objective, completion, constraints)
+    use_prior_progress = value.get("use_prior_progress", False)
+    if type(use_prior_progress) is not bool:
+        raise PlanValidationError("Missing, unexpected, or invalid object fields")
+    return SlimPlan(decision, objective, completion, constraints, use_prior_progress)
 
 
 def parse_plan(text: str, request: PlanRequest) -> Plan | SlimPlan:
@@ -215,7 +232,10 @@ def parse_plan(text: str, request: PlanRequest) -> Plan | SlimPlan:
     if not isinstance(text, str) or len(text) > 200_000:
         raise PlanValidationError("Planner output is not bounded text")
     value = strict_json(text)
-    if isinstance(value, dict) and set(value) == {"decision", "objective", "completion_conditions", "constraints"}:
+    if (isinstance(value, dict)
+            and {"decision", "objective", "completion_conditions", "constraints"} <= set(value)
+            and set(value) <= {"decision", "objective", "completion_conditions", "constraints",
+                               "use_prior_progress"}):
         return _parse_slim(value, request)
     return _parse(value, request)
 

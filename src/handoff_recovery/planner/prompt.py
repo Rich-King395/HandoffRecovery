@@ -13,6 +13,7 @@ OUTPUT_CONTRACT = {
     "objective": "one complete remaining task or bounded verification task",
     "completion_conditions": ["observable conditions for finishing the objective"],
     "constraints": ["public preservation and safety constraints"],
+    "use_prior_progress": "boolean; true only when unverified historical action attempts are needed",
 }
 
 
@@ -51,14 +52,16 @@ def build_messages(request: PlanRequest) -> list[dict[str, Any]]:
         },
         "output_field_contract": OUTPUT_CONTRACT,
         "branch_constraints": (
-            "Return exactly these four fields with no extras. decision must be EXECUTE, VERIFY, or FALLBACK. "
+            "Return the four required fields and optional use_prior_progress. decision must be EXECUTE, VERIFY, or FALLBACK. "
             "For EXECUTE, objective describes all remaining work and completion_conditions describe observable "
             "final state. If the task appears complete, return EXECUTE with an objective to confirm the final state "
             "and finish; do not use FALLBACK for a completed task. For VERIFY, objective describes one bounded "
             "read-only check and completion_conditions describe the evidence that must be observed. constraints "
             "must preserve the original task and prevent unsafe changes. Use FALLBACK only when reliable guidance "
             "cannot be formed; its objective must say to resume the original task and both arrays may be empty. "
-            "Do not return facts, unknowns, evidence IDs, reasons, Markdown, or surrounding commentary."
+            "Set use_prior_progress to true only when the current evidence and recovery objective are insufficient "
+            "without knowing which original actions were attempted; otherwise set it to false. The current screenshot "
+            "is authoritative either way. Do not return facts, unknowns, evidence IDs, reasons, Markdown, or surrounding commentary."
         ),
     }
     content: list[dict[str, Any]] = [{"type": "text", "text": json.dumps(public, ensure_ascii=False, allow_nan=False)}]

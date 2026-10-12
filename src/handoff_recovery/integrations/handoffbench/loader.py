@@ -42,6 +42,8 @@ class CloudBindings:
     validate_action: Callable
     coordinate_space: str
     provider: str
+    agent_class: type
+    validate_configuration: Callable
 
 
 @dataclass(frozen=True)
@@ -242,8 +244,22 @@ def load_cloud_bindings(bench_path: str | Path, provider: str) -> CloudBindings:
     validator = getattr(android, "validate_action", None)
     if not callable(validator):
         raise BenchmarkImportError("Benchmark cloud action validator is incompatible")
-    return CloudBindings(api, common.parse_action, mapper, image_size, validator,
-                         coordinate_space, provider)
+    agent_name = {"qwen": "QwenAgent", "deepseek": "DeepSeekAgent",
+                  "openai": "OpenAIAgent", "claude": "ClaudeAgent"}[provider]
+    agent_class = getattr(agent, agent_name, None)
+    if not isinstance(agent_class, type):
+        raise BenchmarkImportError("Benchmark cloud Agent class is incompatible")
+    validate_configuration = getattr(api, "validate_configuration", None)
+    if not callable(validate_configuration):
+        raise BenchmarkImportError("Benchmark cloud configuration validator is incompatible")
+    normalize = getattr(agent, "normalize_model_output", None)
+    if not callable(normalize):
+        raise BenchmarkImportError(f"Benchmark {provider} output normalizer is incompatible")
+    def parser(raw, *, diagnostics=None):
+        return common.parse_action(normalize(raw, diagnostics=diagnostics),
+                                   diagnostics=diagnostics)
+    return CloudBindings(api, parser, mapper, image_size, validator,
+                         coordinate_space, provider, agent_class, validate_configuration)
 
 
 def load_ui_voyager_bindings(bench_path: str | Path) -> UIVoyagerBindings:

@@ -168,13 +168,26 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
         local = LocalInstruction(
             "Finish the file edit.", (), "execution", handoff=Handoff(
                 "Set only the incorrect time", (), ("09:00 visible",)),
-            prior_progress=("decision 1: tap on public_1",))
+            prior_progress={
+                "purpose": "orientation_only",
+                "reliability": "unverified",
+                "current_state_source": "latest_screenshot",
+                "attempt_summary": {
+                    "decision_count": 1,
+                    "action_types_attempted": ["tap"],
+                },
+                "interpretation_rule": (
+                    "These are attempted actions only. They do not prove that any action "
+                    "succeeded or describe the current UI state."
+                ),
+            })
         with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
                    return_value=self.bindings):
             self.executor.decide(frame(), local)
         prompt = self.client.chat.completions.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
         self.assertIn("prior_progress", prompt)
-        self.assertIn("decision 1: tap on public_1", prompt)
+        self.assertIn('"decision_count": 1', prompt)
+        self.assertIn('"action_types_attempted": ["tap"]', prompt)
         self.assertIn("latest screenshot is authoritative", prompt)
 
     def test_execution_prompt_includes_inspection_and_conditional_actions(self):

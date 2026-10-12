@@ -154,7 +154,12 @@ class HandoffRecoveryAgent:
             raise LifecycleError("A decision must consume exactly one host budget unit")
         if result.kind == "agent_error":
             category = result.error_category or "unclassified_error"
-            raise RuntimeError(f"Local recovery executor failed ({category}; {result.error_type})")
+            error_class = result.error_class or "gui_agent_error"
+            error = RuntimeError(
+                f"Local recovery executor failed ({error_class}: {category}; {result.error_type})")
+            error.category = category
+            error.error_class = error_class
+            raise error
         if result.kind == "invalid_decision":
             # Match HandoffBench's native-agent behavior: the response
             # consumed one decision but produced no device action.
@@ -187,4 +192,9 @@ class HandoffRecoveryAgent:
         report["scope"] = "handoffbench_public_protocol"
         report["public_protocol_version"] = self.public_protocol_version
         report["score_source"] = "external_handoffbench_result"
+        report["budget_semantics"] = {
+            **report.get("budget_semantics", {}),
+            "host_total_budget": "HandoffBench budgets.task",
+            "host_phase_caps": "prefix/resume caps can shorten a phase but never refill total",
+        }
         return report

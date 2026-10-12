@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from handoff_recovery.core.types import LocalInstruction, PublicFrame
 from handoff_recovery.core.protocols import ExecutorNoOp
+from handoff_recovery.core.protocols import apply_history_policy, history_policy_descriptor
 from handoff_recovery.integrations.handoffbench import load_holo_bindings
 from .cloud import _current_context
 
@@ -89,6 +90,8 @@ class HoloExecutor:
             "recovery_scopes": ["original", "verification", "execution", "fallback"],
             "history_scope": "current_task_only_retained_across_takeover",
             "requires_completion_check": False,
+            "history_policy": history_policy_descriptor(),
+            "budget_semantics": "shared_total_v1_gui_decisions_only",
         }
 
     def start_task(self, task_id: str, original_goal: str) -> None:
@@ -125,12 +128,8 @@ class HoloExecutor:
         if instruction.original_goal != self._original_goal:
             raise ValueError("The original goal cannot change within a task")
         context = _current_context(instruction)
-        scope = "original" if instruction.resume_original else instruction.scope
-        if scope != self._context_scope:
-            if self._context_scope is not None:
-                self._contexts[self._context_scope] = deepcopy(self._context)
-            self._context = deepcopy(self._contexts.get("original", [])) if instruction.resume_original else []
-            self._context_scope = scope
+        self._context, self._context_scope = apply_history_policy(
+            self._contexts, self._context, self._context_scope, instruction)
         bindings = self._get_bindings()
         api = bindings.api
         self._frame_number += 1

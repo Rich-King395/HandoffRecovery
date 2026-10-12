@@ -6,10 +6,59 @@ native protocol as long as they expose these normalized methods.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 import json
 from typing import Any, Protocol, runtime_checkable
 
 from .types import LocalInstruction, PlanReply, PlanRequest, PublicFrame
+
+
+HISTORY_POLICY_VERSION = "recovery_history_v1"
+HISTORY_POLICY = {
+    "version": HISTORY_POLICY_VERSION,
+    "original": "retain_original_scope_history",
+    "recovery": "start_each_recovery_scope_with_empty_native_history",
+    "fallback": "restore_original_scope_history",
+    "handoff_context": "structured_recovery_context_outside_native_history",
+}
+
+GUI_AGENT_ERROR_CATEGORIES = frozenset({
+    "request_error", "response_error", "native_parse_error", "action_mapping_error",
+    "history_error", "prompt_error", "completion_check_error", "executor_contract_error",
+    "integration_error",
+})
+
+
+def classify_error(category: str | None, *, source: str) -> str:
+    if source == "planner" or category in {"planner_error", "plan_validation_error",
+                                            "planner_unavailable_or_invalid"}:
+        return "recovery_control_error"
+    if source == "device":
+        return "device_error"
+    if category in GUI_AGENT_ERROR_CATEGORIES or source == "executor":
+        return "gui_agent_error"
+    return "recovery_control_error"
+
+
+def apply_history_policy(contexts, current_history, previous_scope, instruction):
+    """Apply the one native-history policy for every recovery Executor.
+
+    Recovery scopes deliberately start with an empty native conversation. A
+    fallback resumes the original native history; Planner progress and
+    recovery instructions remain separate structured context.
+    """
+    effective_scope = "original" if instruction.resume_original else instruction.scope
+    if effective_scope == previous_scope:
+        return current_history, previous_scope
+    if previous_scope is not None:
+        contexts[previous_scope] = deepcopy(current_history)
+    history = (deepcopy(contexts.get("original", []))
+               if instruction.resume_original else [])
+    return history, effective_scope
+
+
+def history_policy_descriptor():
+    return dict(HISTORY_POLICY)
 
 
 class ExecutorNoOp:

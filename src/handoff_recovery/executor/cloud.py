@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 from handoff_recovery.core.types import LocalInstruction, PublicFrame
+from handoff_recovery.core.protocols import apply_history_policy, history_policy_descriptor
 from handoff_recovery.integrations.handoffbench import load_cloud_bindings
 
 
@@ -73,11 +74,11 @@ def _current_context(instruction: LocalInstruction) -> str | None:
             raise ValueError("Execution scope requires only a recovery handoff")
     elif instruction.verification is not None or instruction.handoff is not None:
         raise ValueError("Original and fallback scopes cannot contain recovery tasks")
-    if scope == "original" and not instruction.public_constraints:
+    # Public constraints remain Planner/Coordinator metadata during the
+    # original phase. Inject them only as recovery context after takeover.
+    if scope == "original":
         return None
     payload = {"scope": scope, "public_constraints": list(instruction.public_constraints)}
-    if instruction.prior_progress:
-        payload["prior_progress"] = list(instruction.prior_progress)
     if instruction.resume_original:
         payload["resume_original_context"] = True
         payload["resume_reason"] = instruction.resume_reason
@@ -118,6 +119,16 @@ def _current_context(instruction: LocalInstruction) -> str | None:
         )
     else:
         guidance = "Continue the unchanged original task with these public constraints."
+    if instruction.prior_progress:
+        # Keep unverified history after the actionable recovery contract. The
+        # current screenshot is supplied separately by the shared adapter and
+        # remains authoritative for present state.
+        payload["prior_progress"] = instruction.prior_progress
+        guidance = (
+            "The latest screenshot is the authoritative current-state evidence. "
+            "The prior_progress entries below are only unverified action attempts; "
+            "they must not be treated as completed work or current UI facts.\n" + guidance
+        )
     return guidance + "\n" + json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
 
@@ -191,19 +202,24 @@ class CloudExecutor:
 
     requires_completion_check = False
 
-    def __init__(self, bench_path: str | Path, configuration: CloudExecutorConfiguration):
+    def __init__(self, bench_path: str | Path, configuration: CloudExecutorConfiguration,
+                 *, allow_legacy_path: bool = False):
         if not isinstance(bench_path, (str, Path)) or not str(bench_path).strip():
             raise ValueError("An explicit Benchmark checkout path is required")
         if not isinstance(configuration, CloudExecutorConfiguration):
             raise TypeError("configuration must be CloudExecutorConfiguration")
         self._bench_path = bench_path
         self._configuration = configuration
+        if type(allow_legacy_path) is not bool:
+            raise TypeError("allow_legacy_path must be boolean")
+        self._allow_legacy_path = allow_legacy_path
         self._bindings = None
         self._task_id: str | None = None
         self._original_goal: str | None = None
         self._context: list[dict] = []
         self._context_scope: str | None = None
         self._contexts: dict[str, list[dict]] = {}
+        self._shared_agent = None
 
     @property
     def provider(self) -> str:
@@ -212,18 +228,44 @@ class CloudExecutor:
     @property
     def descriptor(self) -> dict:
         bindings = self._get_bindings()
+        if hasattr(bindings, "agent_class"):
+            configuration = bindings.validate_configuration()
+            agent = bindings.agent_class()
+            agent._configuration = configuration
+            # Copy the authoritative HandoffBench descriptor. Recovery fields
+            # describe the Coordinator layer and do not redefine GUI protocol.
+            descriptor = dict(agent.descriptor)
+            descriptor.update({
+                "adapter": self.provider,
+                "output_normalization": getattr(agent, "output_normalization", "none"),
+                "recovery_scopes": ["original", "verification", "execution", "fallback"],
+                "recovery_context": "optional_for_execution_verification_fallback_only",
+                "history_policy": history_policy_descriptor(),
+                "requires_completion_check": False,
+                "configuration_source": "handoffbench_provider_validate_configuration",
+                "transport": "handoffbench_shared_cloud_agent",
+                "legacy_path_enabled": False,
+                "budget_semantics": "shared_total_v1_gui_decisions_only",
+            })
+            return descriptor
+        if not self._allow_legacy_path:
+            raise CloudExecutorError(
+                "Cannot describe a cloud Executor without the HandoffBench shared Agent binding",
+                category="integration_error")
         parsed = urlsplit(self._configuration.base_url)
         return {
             "adapter": self.provider,
             "model": self._configuration.model,
             "base_url_host": parsed.hostname or "native",
-            "protocol": ("unique_json_action_v2+qwen_computer_use_xml"
-                         if self.provider == "qwen" else "unique_json_action_v2"),
+            "protocol": "legacy_recovery_only",
             "coordinate_space": bindings.coordinate_space,
             "recovery_scopes": ["original", "verification", "execution", "fallback"],
+            "recovery_context": "legacy_string_append",
             "requires_completion_check": False,
-            "history_scope": "current_task_only_retained_across_takeover",
-            "transport": "handoffbench_api_method",
+            "history_policy": history_policy_descriptor(),
+            "transport": "legacy_recovery_cloud_executor",
+            "configuration_source": "executor_spec_legacy",
+            "legacy_path_enabled": True,
         }
 
     def _get_bindings(self):
@@ -245,6 +287,7 @@ class CloudExecutor:
         self._context = []
         self._context_scope = None
         self._contexts = {"original": []}
+        self._shared_agent = None
 
     def validate_action(self, action, width, height, *, allow_done=True):
         return self._get_bindings().validate_action(action, width, height, allow_done=allow_done)
@@ -276,14 +319,19 @@ class CloudExecutor:
         if instruction.original_goal != self._original_goal:
             raise ValueError("The original goal cannot change within a task")
         context = _current_context(instruction)
-        context_scope = "original" if instruction.resume_original else instruction.scope
-        if context_scope != self._context_scope:
-            if self._context_scope is not None:
-                self._contexts[self._context_scope] = deepcopy(self._context)
-            self._context = (deepcopy(self._contexts.get("original", []))
-                             if instruction.resume_original else [])
-            self._context_scope = context_scope
+        self._context, self._context_scope = apply_history_policy(
+            self._contexts, self._context, self._context_scope, instruction)
         bindings = self._get_bindings()
+        if not hasattr(bindings, "agent_class"):
+            if not self._allow_legacy_path:
+                raise CloudExecutorError(
+                    "HandoffBench shared cloud Agent binding is required; legacy CloudExecutor "
+                    "path is disabled for formal experiments",
+                    category="integration_error")
+            return self._decide_with_legacy_policy(frame, instruction, context, bindings)
+        return self._decide_with_shared_policy(frame, instruction, context, bindings)
+    def _decide_with_legacy_policy(self, frame, instruction, context, bindings):
+        """Compatibility-only path for migration tests; never used by the registry."""
         api = bindings.api
         goal = self._original_goal if context is None else self._original_goal + "\n\n" + context
         try:
@@ -302,9 +350,9 @@ class CloudExecutor:
                     model_size = bindings.image_size(frame.width, frame.height)
                     resampling = getattr(Image, "Resampling", Image)
                     image.convert("RGB").resize(model_size, resampling.LANCZOS).save(model_path, "PNG")
-                configuration = self._provider_configuration(api)
                 raw = api.request_action(
-                    str(model_path), goal, *model_size, configuration=configuration,
+                    str(model_path), goal, *model_size,
+                    configuration=self._provider_configuration(api),
                     history=deepcopy(self._context), allow_long_press=True, allow_drag=True,
                 )
         except CloudExecutorError:
@@ -340,6 +388,55 @@ class CloudExecutor:
                 category="action_mapping_error", cause_type=type(exc).__name__) from None
         self._context.append(deepcopy(parsed))
         return action
+
+    def _decide_with_shared_policy(self, frame, instruction, context, bindings):
+        """Delegate request, parsing, mapping, and validation to HandoffBench."""
+        try:
+            from PIL import Image
+        except ImportError:
+            raise CloudExecutorError("Cloud Executor requires Pillow",
+                                     category="integration_error", cause_type="ImportError") from None
+        if self._shared_agent is None:
+            self._shared_agent = bindings.agent_class()
+            # HandoffBench owns provider defaults, .env loading, validation,
+            # timeout/retry policy, and model selection for the shared path.
+            self._shared_agent._configuration = bindings.validate_configuration()
+        try:
+            with TemporaryDirectory(prefix="handoff-recovery-cloud-") as directory:
+                path = Path(directory) / "public.png"
+                path.write_bytes(frame.png)
+                with Image.open(path) as image:
+                    if image.size != (frame.width, frame.height):
+                        raise ValueError("Public screenshot dimensions differ from the frame")
+                action = self._shared_agent.decide(
+                    {"screenshot": str(path), "width": frame.width, "height": frame.height},
+                    self._original_goal, deepcopy(self._context),
+                    recovery_context=self._context_payload(context) if context else None,
+                )
+        except CloudExecutorError:
+            raise
+        except Exception as exc:
+            raise CloudExecutorError(
+                f"{self.provider} cloud request failed ({type(exc).__name__})",
+                category="request_error", cause_type=type(exc).__name__) from None
+        if action is None:
+            raise CloudExecutorError("Cloud Agent returned no valid action",
+                                     category="native_parse_error")
+        self._context.append(deepcopy(action))
+        return action
+
+    @staticmethod
+    def _context_payload(context: str | None):
+        if not context:
+            return None
+        try:
+            guidance, payload = context.split("\n", 1)
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                return {"guidance": guidance, **parsed}
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return {"guidance": context}
 
 
 def make_cloud_executor(bench_path: str | Path, spec) -> CloudExecutor:

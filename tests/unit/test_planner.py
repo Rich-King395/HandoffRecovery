@@ -300,6 +300,7 @@ class PlannerClientTests(unittest.TestCase):
                          {"type": "array", "items": {"type": "string"}})
         self.assertEqual(properties["constraints"],
                          {"type": "array", "items": {"type": "string"}})
+        self.assertEqual(properties["use_prior_progress"], {"type": "boolean"})
         self.assertNotIn("SECRET_TEST_TOKEN", json.dumps(payload))
         self.assertEqual(result.usage, {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7})
         self.assertGreaterEqual(result.elapsed_seconds, 0)

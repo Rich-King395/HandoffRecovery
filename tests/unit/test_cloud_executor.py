@@ -51,6 +51,7 @@ class CloudExecutorTests(unittest.TestCase):
         self.executor = CloudExecutor(
             "/explicit/benchmark",
             CloudExecutorConfiguration("qwen", "private-key", "qwen-test", ""),
+            allow_legacy_path=True,
         )
         self.executor.start_task("task-1", "Set the requested value.")
 
@@ -107,6 +108,18 @@ class CloudExecutorTests(unittest.TestCase):
         self.assertEqual(_parse_qwen_computer_use(raw), {
             "action": "tap", "target": "settings button", "coords": [820, 54],
         })
+
+    def test_legacy_path_is_rejected_by_default(self):
+        executor = CloudExecutor(
+            "/explicit/benchmark",
+            CloudExecutorConfiguration("qwen", "private-key", "qwen-test", ""),
+        )
+        executor.start_task("task-legacy-guard", "Set the requested value.")
+        with patch("handoff_recovery.executor.cloud.load_cloud_bindings",
+                   return_value=self.bindings):
+            with self.assertRaises(Exception) as caught:
+                executor.decide(frame(), self.instruction())
+        self.assertEqual(caught.exception.category, "integration_error")
 
     def test_qwen_xml_fallback_reaches_shared_mapper(self):
         self.bindings.parse_action.side_effect = ValueError("JSON expected")

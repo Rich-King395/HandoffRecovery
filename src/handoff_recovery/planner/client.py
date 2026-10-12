@@ -35,6 +35,7 @@ def _planner_response_format() -> dict[str, Any]:
                     "objective": {"type": "string"},
                     "completion_conditions": {"type": "array", "items": {"type": "string"}},
                     "constraints": {"type": "array", "items": {"type": "string"}},
+                    "use_prior_progress": {"type": "boolean"},
                 },
                 "required": ["decision", "objective", "completion_conditions", "constraints"],
                 "additionalProperties": False,

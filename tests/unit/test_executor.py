@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 import zlib
 
 from handoff_recovery.core.types import ConditionalAction, Handoff, LocalInstruction, PublicFrame, VerificationTask
+from handoff_recovery.core.protocols import HISTORY_POLICY_VERSION, apply_history_policy
 from handoff_recovery.executor import ExecutorError, GUIOwlConfiguration, GUIOwlExecutor
 from handoff_recovery.integrations.handoffbench import BenchmarkImportError, load_gui_owl_bindings
 from handoff_recovery.integrations.handoffbench.loader import _check_loaded_modules
@@ -96,6 +97,21 @@ class ExecutorTests(unittest.TestCase):
                                        client_factory=self.factory)
         self.executor.start_task("task-1", GOAL)
 
+    def test_history_policy_is_explicit_and_scope_transitions_are_shared(self):
+        self.assertEqual(HISTORY_POLICY_VERSION, "recovery_history_v1")
+        contexts = {"original": [{"action": "tap"}]}
+        history, scope = apply_history_policy(
+            contexts, contexts["original"], "original",
+            LocalInstruction(GOAL, (), "execution",
+                             handoff=Handoff("Finish the remaining task", (), ("Done",))))
+        self.assertEqual((history, scope), ([], "execution"))
+        history.append({"action": "wait"})
+        history, scope = apply_history_policy(
+            contexts, history, scope,
+            LocalInstruction(GOAL, (), "fallback", resume_original=True,
+                             resume_reason="planner_failed"))
+        self.assertEqual((history, scope), ([{"action": "tap"}], "original"))
+
     def test_one_request_uses_native_sampling_and_no_action_normalization_defaults(self):
         action = self.executor.decide(frame(), instruction())
         self.assertEqual(action, {"action": "tap", "coords": [1, 1], "target": "Read the clock"})
@@ -117,9 +133,12 @@ class ExecutorTests(unittest.TestCase):
             self.executor.decide(frame(index), instruction(scope))
             request = self.create.call_args.kwargs["messages"]
             baseline = self.baselines[-1]
-            self.assertEqual(request[:-1], baseline[:-1])
-            self.assertEqual(request[-1]["content"][:-1], baseline[-1]["content"])
-            self.assertIn(f'"scope": "{scope}"', request[-1]["content"][-1]["text"])
+            if scope == "original":
+                self.assertEqual(request, baseline)
+            else:
+                self.assertEqual(request[:-1], baseline[:-1])
+                self.assertEqual(request[-1]["content"][:-1], baseline[-1]["content"])
+                self.assertIn(f'"scope": "{scope}"', request[-1]["content"][-1]["text"])
             expected = 0
             for prior in reversed(scopes[:index]):
                 if prior != scopes[index]:

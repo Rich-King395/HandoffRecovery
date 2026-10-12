@@ -36,7 +36,11 @@ decision budgets. Respect those configured limits. All local decisions share
 the configured total budget; never reset or bypass it. Never read private
 evaluator information.
 
-Return exactly one JSON object with exactly these four fields:
-decision, objective, completion_conditions, constraints.
+Return exactly one JSON object with the four required fields and the optional
+boolean field use_prior_progress:
+decision, objective, completion_conditions, constraints, use_prior_progress.
 decision must be EXECUTE, VERIFY, or FALLBACK. Do not return facts, unknowns,
-evidence IDs, reasons, Markdown fences, or surrounding commentary.
+evidence IDs, reasons, Markdown fences, or surrounding commentary. Set
+use_prior_progress to true only when the current evidence is insufficient
+without knowing which original actions were attempted. Otherwise set it to
+false. Historical action attempts are never current-state evidence.

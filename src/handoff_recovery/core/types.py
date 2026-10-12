@@ -16,6 +16,16 @@ import struct
 
 DEFAULT_TOTAL_DECISIONS = 20
 MAX_CONFIGURED_TOTAL_DECISIONS = 200
+# Must remain compatible with HandoffBench's shared_total_v1 task budget.
+GUI_BUDGET_POLICY_VERSION = "shared_total_v1"
+GUI_BUDGET_SEMANTICS = {
+    "version": GUI_BUDGET_POLICY_VERSION,
+    "total": "one_shared_gui_decision_budget_across_original_prefix_resume_and_recovery",
+    "planner_calls": "separate_preparation_counter_not_gui_decisions",
+    "verification": "verification_actions_consume_the_same_gui_budget",
+    "takeover_actions": "do_not_consume_gui_decisions",
+    "refill_on_takeover": False,
+}
 # Backwards-compatible name for callers that only need the historical default.
 # Runtime validation must use RecoveryBudget.total_decisions instead.
 TOTAL_DECISIONS = DEFAULT_TOTAL_DECISIONS
@@ -232,6 +242,9 @@ class Plan:
     unknowns: tuple[Unknown, ...] = ()
     verification: VerificationTask | None = None
     handoff: Handoff | None = None
+    # Planner opts in to the minimal unverified action-attempt summary only
+    # when the current evidence is insufficient without it.
+    use_prior_progress: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,6 +255,7 @@ class SlimPlan:
     objective: str
     completion_conditions: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
+    use_prior_progress: bool = False
 
     def __post_init__(self):
         if self.decision not in {"VERIFY", "EXECUTE", "FALLBACK"}:
@@ -249,6 +263,8 @@ class SlimPlan:
         _text(self.objective, "slim plan objective")
         _texts(self.completion_conditions, "slim completion conditions")
         _texts(self.constraints, "slim constraints")
+        if type(self.use_prior_progress) is not bool:
+            raise TypeError("use_prior_progress must be boolean")
 
 
 @dataclass(frozen=True)
@@ -311,9 +327,9 @@ class LocalInstruction:
     scope: str
     verification: VerificationTask | None = None
     handoff: Handoff | None = None
-    # Compact, coordinator-produced progress facts. This is deliberately
+    # Compact, coordinator-produced progress metadata. This is deliberately
     # separate from the executor's native conversation history.
-    prior_progress: tuple[str, ...] = ()
+    prior_progress: dict | None = None
     # Fallback may resume the executor's original native conversation instead
     # of starting a new recovery-scoped conversation.
     resume_original: bool = False
@@ -328,7 +344,26 @@ class LocalInstruction:
             raise ValueError("Verification scope requires exactly a verification instruction")
         if (self.scope == "execution") != (self.handoff is not None):
             raise ValueError("Execution scope requires exactly a remaining objective")
-        _texts(self.prior_progress, "prior progress")
+        if self.prior_progress is not None:
+            if not isinstance(self.prior_progress, dict):
+                raise ValueError("prior progress must be an object or None")
+            required = {"purpose", "reliability", "current_state_source",
+                        "attempt_summary", "interpretation_rule"}
+            if set(self.prior_progress) != required:
+                raise ValueError("prior progress has an invalid object shape")
+            if any(not isinstance(self.prior_progress[key], str)
+                   for key in ("purpose", "reliability", "current_state_source",
+                               "interpretation_rule")):
+                raise ValueError("prior progress metadata must be text")
+            summary = self.prior_progress["attempt_summary"]
+            if (not isinstance(summary, dict)
+                    or set(summary) != {"decision_count", "action_types_attempted"}
+                    or type(summary["decision_count"]) is not int
+                    or summary["decision_count"] < 1
+                    or not isinstance(summary["action_types_attempted"], list)
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in summary["action_types_attempted"])):
+                raise ValueError("prior progress attempt summary is invalid")
         if type(self.resume_original) is not bool:
             raise TypeError("resume_original must be a boolean")
         if self.resume_original and self.scope != "fallback":
@@ -345,3 +380,4 @@ class StepResult:
     action: dict | None = None
     error_type: str | None = None
     error_category: str | None = None
+    error_class: str | None = None

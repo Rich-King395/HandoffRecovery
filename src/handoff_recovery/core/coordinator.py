@@ -15,10 +15,12 @@ import time
 from .types import (
     HANDOFFBENCH_ACTIONS, Handoff, LocalInstruction, OwnAction, PlanReply, PlanRequest,
     PublicFrame,
-    RecoveryBudget, SlimPlan, StepResult, VerificationTask, validate_completion_check,
+    GUI_BUDGET_SEMANTICS, RecoveryBudget, SlimPlan, StepResult, VerificationTask,
+    validate_completion_check,
 )
-from .protocols import ExecutorNoOp
-from .protocols import ExecutorProtocol, PlannerProtocol, validate_executor
+from .protocols import (ExecutorNoOp, ExecutorProtocol, PlannerProtocol,
+                        classify_error, history_policy_descriptor,
+                        validate_executor)
 
 
 class LifecycleError(ValueError):
@@ -67,6 +69,7 @@ class RecoveryCoordinator:
         self._cloud_records = []
         self._execution_cloud_calls = None
         self._fallback_reason = None
+        self._use_prior_progress = False
         self.executor.start_task(task_id, original_goal)
         self._emit("task_started", budget=self.budget.total_decisions)
 
@@ -125,15 +128,17 @@ class RecoveryCoordinator:
         self.phase = "preparing"
         self._emit("control_returned", evidence_id=frame.evidence_id)
 
-    def _finish(self, reason, *, action=None, error_type=None, error_category=None):
+    def _finish(self, reason, *, action=None, error_type=None, error_category=None,
+                error_class=None):
         scope = self._local_scope()
         self.terminal_reason = reason
         self.phase = "finished"
         self._awaiting_action = False
         self._emit("task_terminated", reason=reason, error_type=error_type,
-                   **({"error_category": error_category} if error_category else {}))
+                   **({"error_category": error_category} if error_category else {}),
+                   **({"error_class": error_class} if error_class else {}))
         return StepResult(reason, scope, self.decisions_used or None, deepcopy(action), error_type,
-                          error_category)
+                          error_category, error_class)
 
     def _local_scope(self):
         return {"verifying": "verification", "reviewing": "verification", "executing": "execution",
@@ -156,19 +161,34 @@ class RecoveryCoordinator:
         action["completion_check"] = [dict(item) for item in checks]
 
     def _progress_summary(self):
-        """Return bounded, semantic progress facts for the next local prompt."""
-        items = []
-        for record in self._history:
-            if record.scope != "original":
-                continue
+        """Return minimal, explicitly unverified history metadata.
+
+        This is an orientation signal, not a state summary. Action attempts
+        and model thoughts cannot establish what the device currently shows;
+        the latest public frame remains the only current-state evidence.
+        """
+        attempts = [record for record in self._history if record.scope == "original"]
+        if not attempts:
+            return None
+        action_types = []
+        for record in attempts:
             action = record.action
             kind = action.get("action", "unknown")
-            fact = f"decision {record.decision_number}: {kind} on {record.frame_id}"
-            thought = action.get("thought")
-            if isinstance(thought, str) and thought.strip():
-                fact += f"; model note: {thought.strip()[:240]}"
-            items.append(fact)
-        return tuple(items[-6:])
+            if kind not in action_types:
+                action_types.append(kind)
+        return {
+            "purpose": "orientation_only",
+            "reliability": "unverified",
+            "current_state_source": "latest_screenshot",
+            "attempt_summary": {
+                "decision_count": len(attempts),
+                "action_types_attempted": action_types,
+            },
+            "interpretation_rule": (
+                "These are attempted actions only. They do not prove that any action "
+                "succeeded or describe the current UI state."
+            ),
+        }
 
     def _fall_back(self, reason):
         self.phase = "fallback_execution"
@@ -212,6 +232,8 @@ class RecoveryCoordinator:
             validate_plan(reply.plan, request)
             plan = reply.plan
             record["plan"] = asdict(plan)
+            self._use_prior_progress = bool(getattr(plan, "use_prior_progress", False))
+            self._emit("prior_progress_policy", enabled=self._use_prior_progress)
             # Usage metadata only, never raw response bodies or credentials.
             record["usage"] = {key: value for key, value in reply.usage.items()
                                if isinstance(key, str) and type(value) is int and value >= 0}
@@ -244,6 +266,7 @@ class RecoveryCoordinator:
             category = getattr(exc, "category", None)
             if isinstance(category, str) and category.isidentifier():
                 record["error_category"] = category
+            record["error_class"] = classify_error(category, source="planner")
             self._fall_back("planner_unavailable_or_invalid")
         finally:
             record["elapsed_seconds"] = round(time.monotonic() - started, 6)
@@ -274,8 +297,9 @@ class RecoveryCoordinator:
             verification=self._verification if scope == "verification" else None,
             handoff=self._handoff if scope == "execution" else None,
             prior_progress=(self._progress_summary()
-                            if self.include_prior_progress and scope in {"execution", "fallback"}
-                            else ()),
+                            if (self.include_prior_progress and self._use_prior_progress
+                                and scope in {"execution", "fallback"})
+                            else None),
             resume_original=(scope == "fallback"),
             resume_reason=(self._fallback_reason if scope == "fallback" else None))
         self.decisions_used += 1  # Count attempts, errors and scoped completion too.
@@ -302,13 +326,15 @@ class RecoveryCoordinator:
             error_category = getattr(exc, "category", None)
             if not isinstance(error_category, str) or not error_category:
                 error_category = "executor_contract_error"
+            error_class = classify_error(error_category, source="executor")
             self._history.append(OwnAction(self.decisions_used,
                                           {"action": "decision_error", "error_type": type(exc).__name__,
                                            **({"error_category": error_category}
-                                              if error_category is not None else {})},
+                                              if error_category is not None else {}),
+                                           "error_class": error_class},
                                           scope, frame.evidence_id))
             return self._finish("agent_error", error_type=type(exc).__name__,
-                                error_category=error_category)
+                                error_category=error_category, error_class=error_class)
         self._history.append(own)
         self._emit("local_decision", scope=scope, frame_id=frame.evidence_id, action=action)
         kind = action["action"]
@@ -350,13 +376,24 @@ class RecoveryCoordinator:
             "scope": "standalone_prototype_not_benchmark_evaluation", "task_id": self.task_id,
             "original_goal": self.original_goal, "public_constraints": list(self.public_constraints),
             "phase": self.phase, "termination_reason": self.terminal_reason,
+            "error_class": next(
+                (event.get("error_class") for event in reversed(self._events)
+                 if event.get("error_class")),
+                next((record.get("error_class") for record in reversed(self._cloud_records)
+                      if record.get("error_class")), None)),
             "task_success": None, "score_source": "external_benchmark_required",
             "budget": {"total": self.budget.total_decisions, "used": self.decisions_used,
                        "remaining": self.remaining_decisions},
+            "budget_semantics": deepcopy(GUI_BUDGET_SEMANTICS),
             "budget_policy": {"max_cloud_calls": self.budget.max_cloud_calls,
                                "max_verification_rounds": self.budget.max_verification_rounds},
             "cloud_calls": self.cloud_calls,
-            "recovery_features": {"structured_progress": self.include_prior_progress},
+            "recovery_features": {
+                "structured_progress": self.include_prior_progress,
+                "prior_progress_selective": True,
+                "prior_progress_enabled_for_current_recovery": self._use_prior_progress,
+            },
+            "history_policy": history_policy_descriptor(),
             "fallback": {
                 "resume_original_context": True,
                 "reason": self._fallback_reason,

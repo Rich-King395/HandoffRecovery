@@ -20,6 +20,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from handoff_recovery.core.types import LocalInstruction, PublicFrame
+from handoff_recovery.core.protocols import apply_history_policy, history_policy_descriptor
 from handoff_recovery.integrations.handoffbench import load_gui_owl_bindings
 
 
@@ -81,7 +82,9 @@ def _current_context(instruction: LocalInstruction) -> str | None:
             raise ValueError("Execution scope requires only a recovery handoff")
     elif instruction.verification is not None or instruction.handoff is not None:
         raise ValueError("Original and fallback scopes cannot contain recovery tasks")
-    if scope == "original" and not instruction.public_constraints:
+    # Keep the pre-handoff GUI prompt identical to the baseline. Constraints
+    # are injected only when a recovery scope is active.
+    if scope == "original":
         return None
     payload = {"scope": scope, "public_constraints": list(instruction.public_constraints)}
     if instruction.resume_original:
@@ -168,6 +171,8 @@ class GUIOwlExecutor:
             "coordinate_space": "image_pixels",
             "recovery_scopes": ["original", "verification", "execution", "fallback"],
             "requires_completion_check": False,
+            "history_policy": history_policy_descriptor(),
+            "budget_semantics": "shared_total_v1_gui_decisions_only",
         }
 
     def start_task(self, task_id: str, original_goal: str) -> None:
@@ -196,13 +201,8 @@ class GUIOwlExecutor:
         if instruction.original_goal != self._original_goal:
             raise ValueError("The original goal cannot change within a task")
         context = _current_context(instruction)
-        context_scope = "original" if instruction.resume_original else instruction.scope
-        if context_scope != self._context_scope:
-            if self._context_scope is not None:
-                self._contexts[self._context_scope] = deepcopy(self._context)
-            self._context = (deepcopy(self._contexts.get("original", []))
-                             if instruction.resume_original else [])
-            self._context_scope = context_scope
+        self._context, self._context_scope = apply_history_policy(
+            self._contexts, self._context, self._context_scope, instruction)
         if self._bindings is None:
             self._bindings = load_gui_owl_bindings(self._bench_path)
         bindings = self._bindings
