@@ -21,9 +21,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from handoff_recovery.core.types import MAX_CONFIGURED_TOTAL_DECISIONS
-
-MAX_CONFIGURED_DECISIONS = MAX_CONFIGURED_TOTAL_DECISIONS
+from handoff_recovery.core.types import DEFAULT_TOTAL_DECISIONS
+from handoff_recovery.executor.condition_updates import experiment_metadata
 
 
 class _Tee:
@@ -165,12 +164,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--appium-url")
     parser.add_argument("--local-base-url",
                         help="Override the configured local agent OpenAI-compatible base URL")
-    parser.add_argument("--local-agent", choices=("phonebuddy", "gui_owl", "qwen", "deepseek", "openai", "claude", "ui_voyager", "holo"),
+    parser.add_argument("--local-model",
+                        help="Override the configured local agent model identifier")
+    parser.add_argument("--configuration-source",
+                        choices=("explicit_executor_spec", "handoffbench_provider_validate_configuration"),
+                        help="Select explicit local settings or HandoffBench-validated settings")
+    parser.add_argument("--local-agent", choices=("phonebuddy", "gui_owl", "qwen", "deepseek", "openai", "claude", "ui_voyager", "holo", "ui_venus", "openmobile", "mai_gym", "qwen35", "lfm25_vl"),
                         help="GUI Agent adapter; defaults to RECOVERY_LOCAL_AGENT")
     parser.add_argument("--local-timeout-seconds", type=float)
     parser.add_argument("--local-total-timeout-seconds", type=float)
     parser.add_argument("--local-proxy-mode")
     parser.add_argument("--local-max-output-tokens", type=int)
+    parser.add_argument("--recovery-history-mode", choices=("isolated", "original_snapshot"),
+                        help="Native history at recovery entry; default isolates recovery from pre-takeover history")
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--on-task-error", choices=("continue", "stop"), default="continue")
     parser.add_argument("--retention", choices=("detailed", "compact", "summary"))
@@ -182,19 +188,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--planner-model",
                         help="Override the configured Planner model for this batch")
     parser.add_argument("--max-decisions", type=int,
-                        help="Shared local GUI decision budget for every trial (default 20, maximum 200)")
+                        help=f"Shared local GUI decision budget for every trial (positive integer, default {DEFAULT_TOTAL_DECISIONS})")
     parser.add_argument("--planner-debug-response-dir", type=Path)
-    parser.add_argument("--disable-structured-progress", action="store_true",
-                        help="A/B control: omit the compact pre-handoff progress summary")
     parser.add_argument("--disable-completion-check", action="store_true",
                         help="A/B control: omit and do not enforce recovery completion_check")
+    parser.add_argument("--enable-completion-check", action="store_true",
+                        help="Enable recovery completion_check (default: disabled)")
+    parser.add_argument("--recovery-constraints", choices=("enabled", "disabled"),
+                        default="disabled",
+                        help="Whether Planner constraints are rendered in the GUI Agent recovery prompt (default: disabled)")
+    parser.add_argument("--recovery-uncertain", choices=("enabled", "disabled"),
+                        default="disabled",
+                        help="Whether Planner uncertain progress is rendered in the GUI Agent recovery prompt (default: disabled)")
+    parser.add_argument("--condition-updates", choices=("enabled", "disabled"),
+                        help="Independent condition-claim switch; omitted preserves existing adapter behavior")
+    parser.add_argument("--completion-policy", choices=("conditions", "native"), default="conditions",
+                        help="Recovery termination: existing condition gate or native model completion")
+    parser.add_argument("--condition-update-policy", choices=("host", "model_claim"),
+                        help="Who marks model-claimed recovery conditions satisfied; default model_claim")
     parser.add_argument("--executor-adapter",
                         help="GUI Agent registry name or module:factory path; defaults to --local-agent")
     args = parser.parse_args(argv)
+    if args.completion_policy == "native" and args.enable_completion_check:
+        parser.error("--completion-policy native cannot enable completion_check")
+    if args.disable_completion_check and args.enable_completion_check:
+        parser.error("--disable-completion-check and --enable-completion-check are mutually exclusive")
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")
-    if args.max_decisions is not None and not 1 <= args.max_decisions <= MAX_CONFIGURED_DECISIONS:
-        parser.error(f"--max-decisions must be an integer from 1 to {MAX_CONFIGURED_DECISIONS}")
+    if args.max_decisions is not None and args.max_decisions < 1:
+        parser.error("--max-decisions must be a positive integer")
     for value, name in ((args.local_timeout_seconds, "--local-timeout-seconds"),
                         (args.local_total_timeout_seconds, "--local-total-timeout-seconds")):
         if value is not None and value <= 0:
@@ -246,6 +268,7 @@ def _write_report(path: Path, summary: dict) -> None:
     termination_reasons = {}
     error_types = {}
     error_classes = {}
+    error_categories = {}
     budget_values = []
     budget_totals = []
     for row in valid:
@@ -257,15 +280,26 @@ def _write_report(path: Path, summary: dict) -> None:
         reason = row.get("termination_reason")
         if reason:
             termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
-        error_class = row.get("error_class")
-        if error_class:
-            error_classes[error_class] = error_classes.get(error_class, 0) + 1
         for error_type in row.get("cloud_error_types", []) or []:
             error_types[error_type] = error_types.get(error_type, 0) + 1
         if isinstance(row.get("budget_used"), int):
             budget_values.append(row["budget_used"])
         if isinstance(row.get("budget_total"), int):
             budget_totals.append(row["budget_total"])
+    # Error diagnostics cover invalid/error trials as well as valid takeovers;
+    # excluding them would make protocol and environment failures disappear
+    # from the audit that distinguishes them from recovery decisions.
+    for row in trials:
+        for error_class in ([row.get("error_class")] if row.get("error_class") else []):
+            error_classes[error_class] = error_classes.get(error_class, 0) + 1
+        for error_class in row.get("cloud_error_classes", []) or []:
+            if error_class:
+                error_classes[error_class] = error_classes.get(error_class, 0) + 1
+        for category in (([row.get("error_category")] if row.get("error_category") else [])
+                         + (row.get("error_categories") or [])
+                         + (row.get("cloud_error_categories") or [])):
+            if category:
+                error_categories[category] = error_categories.get(category, 0) + 1
     budget_exhausted = sum(
         isinstance(row.get("budget_used"), int)
         and isinstance(row.get("budget_total"), int)
@@ -316,6 +350,10 @@ def _write_report(path: Path, summary: dict) -> None:
         f"Local agent: `{summary['executor']['agent']}` / `{summary['executor']['model']}` "
         f"(adapter `{summary['executor'].get('adapter', 'unknown')}`)",
         f"Completion check: `{summary['executor'].get('completion_check_enabled', False)}`",
+        f"Recovery native history mode: `{summary['executor'].get('recovery_history_mode', 'isolated')}`",
+        f"Condition update policy: `{summary['executor'].get('condition_update_policy', 'host')}`",
+        f"Completion policy: `{summary['executor'].get('completion_policy', 'conditions')}`",
+        f"Condition updates: `{summary['executor'].get('condition_updates', 'legacy')}`",
         f"Decision budget: `{summary.get('max_decisions', 'unknown')}`",
         "Budget semantics: one shared GUI decision budget across original/prefix/resume/recovery; "
         "Planner calls and takeover actions are separate counters; VERIFY actions consume GUI budget.",
@@ -354,6 +392,7 @@ def _write_report(path: Path, summary: dict) -> None:
         f"| Termination reasons | {', '.join(f'{k}={v}' for k, v in sorted(termination_reasons.items())) or 'none recorded'} |",
         f"| Error types | {', '.join(f'{k}={v}' for k, v in sorted(error_types.items())) or 'none recorded'} |",
         f"| Error classes | {', '.join(f'{k}={v}' for k, v in sorted(error_classes.items())) or 'none recorded'} |",
+        f"| Error categories | {', '.join(f'{k}={v}' for k, v in sorted(error_categories.items())) or 'none recorded'} |",
         f"| Decision budget used | {sum(budget_values)}/{sum(budget_totals)} total; "
         f"{(sum(budget_values) / len(budget_values)):.2f} average |" if budget_values and budget_totals
         else "| Decision budget used | n/a |",
@@ -393,9 +432,15 @@ def main(argv: list[str] | None = None) -> int:
     prefixes = {"phonebuddy": "PHONEBUDDY_", "gui_owl": "GUI_OWL_",
                 "qwen": "QWEN_", "deepseek": "DEEPSEEK_",
                 "openai": "OPENAI_", "claude": "CLAUDE_",
-                "ui_voyager": "UI_VOYAGER_", "holo": "HOLO_"}
+                "ui_voyager": "UI_VOYAGER_", "holo": "HOLO_",
+                "ui_venus": "UI_VENUS_", "openmobile": "OPENMOBILE_", "mai_gym": "MAI_GYM_",
+                "qwen35": "QWEN35_", "lfm25_vl": "LFM25_VL_"}
     if agent_name not in prefixes:
-        raise ValueError("RECOVERY_LOCAL_AGENT must be one of phonebuddy, gui_owl, qwen, deepseek, openai, claude, ui_voyager or holo")
+        raise ValueError("RECOVERY_LOCAL_AGENT must be one of " + ", ".join(prefixes))
+    if agent_name in {"ui_venus", "openmobile", "mai_gym"} and (args.condition_updates != "disabled"
+            or args.completion_policy != "native" or args.enable_completion_check):
+        raise ValueError(("UI-Venus" if agent_name == "ui_venus" else "MAIGym" if agent_name == "mai_gym" else "OpenMobile")
+                         + " requires condition updates disabled, native completion and no completion_check")
     local_prefix = prefixes[agent_name]
     local = {
         "agent": agent_name,
@@ -414,16 +459,34 @@ def main(argv: list[str] | None = None) -> int:
         ).strip(),
         "prompt_path": _path(values[local_prefix + "PROMPT_PATH"]) if values.get(local_prefix + "PROMPT_PATH") else "",
     }
-    local["timeout_seconds"] = args.local_timeout_seconds or float(values.get(local_prefix + "TIMEOUT_SECONDS", "120"))
-    local["total_timeout_seconds"] = args.local_total_timeout_seconds or float(values.get(local_prefix + "TOTAL_TIMEOUT_SECONDS", "120"))
+    local["timeout_seconds"] = args.local_timeout_seconds or float(values.get(local_prefix + "TIMEOUT_SECONDS", "600" if agent_name == "mai_gym" else "300" if agent_name == "openmobile" else "120"))
+    local["total_timeout_seconds"] = args.local_total_timeout_seconds or float(values.get(local_prefix + "TOTAL_TIMEOUT_SECONDS", "600" if agent_name == "mai_gym" else "300" if agent_name == "openmobile" else "120"))
     local["proxy_mode"] = args.local_proxy_mode or values.get(local_prefix + "PROXY_MODE", "environment")
-    local["max_output_tokens"] = args.local_max_output_tokens or int(values.get(local_prefix + "MAX_OUTPUT_TOKENS", "4096"))
+    if agent_name in {"openmobile", "mai_gym"}:
+        configured_limit = (values.get(local_prefix + "MAX_OUTPUT_TOKENS") or "").strip()
+        local["max_output_tokens"] = args.local_max_output_tokens or (int(configured_limit) if configured_limit else 0)
+    else:
+        local["max_output_tokens"] = args.local_max_output_tokens or int(values.get(local_prefix + "MAX_OUTPUT_TOKENS", "16384" if agent_name == "ui_venus" else "4096"))
+    local["recovery_history_mode"] = (args.recovery_history_mode
+                                       or values.get("RECOVERY_HISTORY_MODE", "isolated"))
+    if local["recovery_history_mode"] not in {"isolated", "original_snapshot"}:
+        raise ValueError("RECOVERY_HISTORY_MODE must be isolated or original_snapshot")
+    condition_update_policy = (args.condition_update_policy
+                               or values.get("RECOVERY_CONDITION_UPDATE_POLICY", "model_claim")).strip()
+    if condition_update_policy not in {"host", "model_claim"}:
+        raise ValueError("RECOVERY_CONDITION_UPDATE_POLICY must be host or model_claim")
+    if (args.condition_updates == "disabled" and args.completion_policy == "conditions"
+            and condition_update_policy == "model_claim" and not args.enable_completion_check):
+        raise ValueError("Disabled condition updates need native completion, host claims, or completion_check")
     if args.local_base_url:
         local["base_url"] = args.local_base_url
-    if agent_name not in {"qwen", "deepseek", "openai", "claude"} and (
+    if args.local_model:
+        local["model"] = args.local_model
+    configuration_source = args.configuration_source or "handoffbench_provider_validate_configuration"
+    if configuration_source == "explicit_executor_spec" and agent_name not in {"qwen", "deepseek", "openai", "claude", "qwen35", "lfm25_vl"} and (
             (agent_name != "qwen" and not local["base_url"]) or not local["model"]):
         raise ValueError("Local agent configuration is incomplete for " + agent_name)
-    if agent_name in {"qwen", "deepseek", "openai", "claude"}:
+    if configuration_source == "handoffbench_provider_validate_configuration" and agent_name in {"qwen", "deepseek", "openai", "claude", "qwen35", "lfm25_vl"}:
         # Cloud GUI settings are owned by the selected HandoffBench provider.
         # Resolve them before naming the run so result metadata and folder names
         # cannot silently describe a different model than the request used.
@@ -438,14 +501,39 @@ def main(argv: list[str] | None = None) -> int:
         local["model"] = bench_configuration.model
         local["base_url"] = bench_configuration.base_url
         local["configuration_source"] = "handoffbench_provider_validate_configuration"
+        if agent_name in {"qwen35", "lfm25_vl"}:
+            for name in ("timeout_seconds", "total_timeout_seconds", "proxy_mode", "max_output_tokens"):
+                local[name] = getattr(bench_configuration, name)
+    elif configuration_source == "handoffbench_provider_validate_configuration":
+        # Local model configuration is resolved by the same HandoffBench
+        # validator used by its baseline Agent. Recovery only selects the
+        # adapter and experiment controls.
+        try:
+            from handoff_recovery.executor.registry import load_local_configuration
+            bench_configuration = load_local_configuration(bench, agent_name)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not load {agent_name} configuration from HandoffBench: {type(exc).__name__}"
+            ) from None
+        local["model"] = bench_configuration.model
+        local["base_url"] = bench_configuration.base_url
+        local["timeout_seconds"] = bench_configuration.timeout_seconds
+        local["max_output_tokens"] = bench_configuration.max_tokens
+        if agent_name == "phonebuddy":
+            local["prompt_path"] = str(bench_configuration.prompt_path)
+        local["key_var"] = "HANDOFFBENCH_VALIDATED"
+        local["configuration_source"] = "handoffbench_provider_validate_configuration"
+    else:
+        local["configuration_source"] = "explicit_executor_spec"
+    if agent_name in {"openmobile", "mai_gym"} and local["max_output_tokens"] < 1:
+        raise ValueError(("MAIGym" if agent_name == "mai_gym" else "OpenMobile") + " requires an explicit output limit in its selected configuration source")
     executor_adapter = (args.executor_adapter
                         or values.get("RECOVERY_EXECUTOR_ADAPTER", agent_name).strip()
                         or agent_name)
-    max_decisions = args.max_decisions or int(values.get("RECOVERY_MAX_DECISIONS", "20"))
-    if not 1 <= max_decisions <= MAX_CONFIGURED_DECISIONS:
-        raise ValueError(
-            f"RECOVERY_MAX_DECISIONS must be an integer from 1 to {MAX_CONFIGURED_DECISIONS}"
-        )
+    max_decisions = (args.max_decisions if args.max_decisions is not None
+                     else int(values.get("RECOVERY_MAX_DECISIONS", str(DEFAULT_TOTAL_DECISIONS))))
+    if max_decisions < 1:
+        raise ValueError("RECOVERY_MAX_DECISIONS must be a positive integer")
     selected = _select_tasks(args, bench)
     task_metadata = _task_metadata(bench)
     retention = args.retention or values.get("RECOVERY_RESULT_RETENTION", "detailed")
@@ -473,8 +561,16 @@ def main(argv: list[str] | None = None) -> int:
         "executor": {"agent": local["agent"], "adapter": executor_adapter,
                       "model": local["model"], "base_url": local["base_url"],
                       "configuration_source": local.get("configuration_source", "recovery_env"),
-                      "completion_check_enabled": bool(
-                          local["agent"] == "phonebuddy" and not args.disable_completion_check)},
+                      **({"timeout_seconds": local["timeout_seconds"],
+                          "max_output_tokens": local["max_output_tokens"]}
+                         if agent_name in {"gui_owl", "phonebuddy", "ui_voyager", "holo", "ui_venus", "openmobile", "mai_gym", "qwen35", "lfm25_vl"} else {}),
+                      "recovery_history_mode": local["recovery_history_mode"],
+                      "recovery_constraints": args.recovery_constraints,
+                      "recovery_uncertain": args.recovery_uncertain,
+                      "condition_update_policy": condition_update_policy,
+                      **experiment_metadata(args.condition_updates, agent_name, args.completion_policy),
+                      "completion_policy": args.completion_policy,
+                      "completion_check_enabled": bool(args.enable_completion_check)},
         "max_decisions": max_decisions,
         "trials": [],
     }
@@ -509,16 +605,24 @@ def main(argv: list[str] | None = None) -> int:
                    "--max-decisions", str(max_decisions),
                    "--local-agent", local["agent"], "--local-base-url", local["base_url"],
                    "--local-model", local["model"], "--local-key-var", local["key_var"],
+                   "--configuration-source", local.get("configuration_source", "explicit_executor_spec"),
                    "--executor-adapter", executor_adapter,
                    "--local-timeout-seconds", str(local["timeout_seconds"]),
                    "--local-total-timeout-seconds", str(local["total_timeout_seconds"]),
                    "--local-proxy-mode", local["proxy_mode"],
                    "--local-max-output-tokens", str(local["max_output_tokens"]),
+                   "--recovery-history-mode", local["recovery_history_mode"],
+                   "--recovery-constraints", args.recovery_constraints,
+                   "--recovery-uncertain", args.recovery_uncertain,
+                   "--condition-update-policy", condition_update_policy,
+                   "--completion-policy", args.completion_policy,
                    "--output", str(case)]
-        if args.disable_structured_progress:
-            command.append("--disable-structured-progress")
+        if args.condition_updates is not None:
+            command.extend(("--condition-updates", args.condition_updates))
         if args.disable_completion_check:
             command.append("--disable-completion-check")
+        if args.enable_completion_check:
+            command.append("--enable-completion-check")
         if args.planner_debug_response_dir:
             debug_dir = args.planner_debug_response_dir.resolve() / f"task_{task_id}_trial_{index}"
             command.extend(("--planner-debug-response-dir", str(debug_dir)))
@@ -559,14 +663,24 @@ def main(argv: list[str] | None = None) -> int:
                     "takeover_status": result.get("takeover_status"),
                     "flow_passed": trial.get("flow_passed"),
                     "cloud_error_types": trial.get("cloud_error_types", []),
+                    "cloud_error_categories": trial.get("cloud_error_categories", []),
+                    "cloud_error_classes": trial.get("cloud_error_classes", []),
+                    "error_category": trial.get("error_category") or recovery.get("error_category"),
+                    "error_class": trial.get("error_class") or recovery.get("error_class"),
+                    "error_type": trial.get("error_type") or recovery.get("error_type"),
                     "directory": directory,
                     "budget_total": budget.get("total"),
                     "budget_used": budget.get("used"),
                     "cloud_calls": recovery.get("cloud_calls", len(requests)),
                     "cloud_calls_after_handoff": recovery.get("cloud_calls_after_handoff", 0),
                     "verification_rounds": recovery.get("verification_rounds", 0),
+                    "condition_update_counts": recovery.get("condition_update_counts", {}),
+                    "condition_count": len(recovery.get("condition_status", [])),
+                    "satisfied_condition_count": sum(item.get("status") == "satisfied"
+                                                     for item in recovery.get("condition_status", [])),
+                    "completion_rejections": sum(item.get("event") == "done_rejected"
+                                                 for item in recovery.get("events", [])),
                     "termination_reason": recovery.get("termination_reason"),
-                    "error_class": recovery.get("error_class"),
                     "planner_decision": plans[-1].get("decision") if plans else None,
                     "fallback": bool(recovery.get("fallback", {}).get("reason")),
                 })

@@ -9,7 +9,9 @@ from __future__ import annotations
 from copy import deepcopy
 from importlib import import_module
 
-from handoff_recovery.core.coordinator import LifecycleError, RecoveryCoordinator
+from handoff_recovery.core.coordinator import (
+    CONDITION_UPDATE_POLICIES, LifecycleError, RecoveryCoordinator,
+)
 from handoff_recovery.core.protocols import validate_executor
 from handoff_recovery.core.types import PublicFrame, RecoveryBudget
 from .loader import BenchmarkImportError, load_gui_owl_bindings
@@ -20,7 +22,8 @@ class HandoffRecoveryAgent:
     retain_full_public_history = True
 
     def __init__(self, *, bench_path, planner, executor, public_constraints=(),
-                 include_prior_progress=True, action_validator=None):
+                 action_validator=None, condition_update_policy="model_claim", completion_policy="conditions",
+                 condition_updates_enabled=None):
         # Built-in adapters retain the historical GUI-Owl normalized-action
         # validator. Custom executors may supply their own validator so this
         # bridge does not depend on a concrete GUI Agent implementation.
@@ -39,10 +42,20 @@ class HandoffRecoveryAgent:
             raise BenchmarkImportError("Benchmark public handoff protocol is incompatible")
         if not isinstance(public_constraints, tuple):
             raise TypeError("Public constraints must be an explicit tuple")
+        if condition_update_policy not in CONDITION_UPDATE_POLICIES:
+            raise ValueError("condition_update_policy must be host or model_claim")
         self._planner = planner
         self._executor = executor
         self._constraints = public_constraints
-        self._include_prior_progress = include_prior_progress
+        self._condition_update_policy = condition_update_policy
+        if completion_policy not in {"conditions", "native"}:
+            raise ValueError("completion_policy must be conditions or native")
+        if completion_policy == "native" and getattr(executor, "requires_completion_check", False):
+            raise ValueError("native completion cannot require completion_check")
+        self._completion_policy = completion_policy
+        if condition_updates_enabled is not None and type(condition_updates_enabled) is not bool:
+            raise TypeError("condition_updates_enabled must be boolean or None")
+        self._condition_updates_enabled = condition_updates_enabled
         self.reset()
 
     def reset(self):
@@ -51,6 +64,7 @@ class HandoffRecoveryAgent:
         self._decision_context = None
         self._pending_return = None
         self._pending_action = None
+        self._pending_condition_updates = ()
         self._frame_number = 0
 
     def _require_started(self):
@@ -73,8 +87,10 @@ class HandoffRecoveryAgent:
         self.coordinator = RecoveryCoordinator(
             task_id=str(context.task_id), original_goal=context.goal,
             public_constraints=self._constraints, planner=self._planner, executor=self._executor,
-            include_prior_progress=self._include_prior_progress,
-            budget=RecoveryBudget(total_decisions=context.max_decisions))
+            budget=RecoveryBudget(total_decisions=context.max_decisions),
+            condition_update_policy=self._condition_update_policy,
+            completion_policy=self._completion_policy,
+            condition_updates_enabled=self._condition_updates_enabled)
 
     @staticmethod
     def _observation_identity(observation):
@@ -123,12 +139,11 @@ class HandoffRecoveryAgent:
         if (context.decisions_used != coordinator.decisions_used
                 or context.decision_number != coordinator.decisions_used + 1):
             raise LifecycleError("Host and recovery decision counts differ")
-        # HandoffBench may apply a smaller prefix/resume phase cap while the
-        # shared task budget remains larger. The host owns that phase cap;
-        # recovery only verifies it is positive and within the shared budget.
+        # The host exposes one remaining GUI decision budget for the whole
+        # task. Recovery does not apply an independent EXECUTE/VERIFY cap.
         if (type(context.decisions_remaining) is not int
                 or not 1 <= context.decisions_remaining <= coordinator.remaining_decisions):
-            raise LifecycleError("Host phase budget exceeds the shared decision budget")
+            raise LifecycleError("Host remaining budget does not match the shared decision budget")
         self._decision_context = context
 
     def decide(self, observation, goal, history):
@@ -167,10 +182,18 @@ class HandoffRecoveryAgent:
         action = result.action
         if not isinstance(action, dict):
             raise LifecycleError("The coordinator did not return a counted decision")
+        self._pending_condition_updates = tuple(result.condition_updates)
         self._action_validator(action, frame.width, frame.height, allow_done=True)
-        if result.scope == "verification" and action.get("action") in {"done", "fail"}:
-            # Includes done at decision 20: it is still verification-only and
-            # must never become an original-task completion or a free wait.
+        if result.kind in {"task_complete", "agent_failed"}:
+            # The Coordinator has resolved a final confirmation (or an
+            # execution terminal action). Return a normal terminal action so
+            # HandoffBench can run its authoritative task evaluator.
+            return deepcopy(action)
+        if (result.kind in {"verification_complete", "verification_failed"}
+                or (result.kind == "budget_exhausted" and result.scope == "verification"
+                    and action.get("action") in {"done", "fail"})):
+            # Non-final verification is scoped evidence collection and must
+            # not terminate the original task.
             return self._protocol.SubtaskCompletion(action=deepcopy(action), scope="verification")
         if result.kind == "action":
             self._pending_action = context.decision_number
@@ -184,7 +207,29 @@ class HandoffRecoveryAgent:
                 or result.decision_number != coordinator.decisions_used):
             raise LifecycleError("Device acknowledgement does not match the pending action")
         self._pending_action = None
-        coordinator.acknowledge_action(success=result.success)
+        # Newer public runners may expose state evidence or semantic
+        # condition IDs on ActionResult.  Older runners only expose success;
+        # the optional fields preserve that baseline behavior.
+        state_changed = getattr(result, "state_changed", None)
+        satisfied_conditions = tuple(getattr(result, "satisfied_conditions", ()) or ())
+        model_claimed_conditions = ()
+        if self._condition_update_policy == "model_claim" and result.success:
+            model_claimed_conditions = tuple(
+                item["condition"] for item in self._pending_condition_updates
+                if item.get("status") == "satisfied"
+            )
+        coordinator.acknowledge_action(
+            success=result.success,
+            state_changed=state_changed,
+            satisfied_conditions=satisfied_conditions,
+            model_claimed_conditions=model_claimed_conditions,
+        )
+        self._pending_condition_updates = ()
+
+    @property
+    def pending_condition_updates(self):
+        """Model condition claims awaiting external host verification."""
+        return tuple(deepcopy(item) for item in self._pending_condition_updates)
 
     def report(self):
         """Recovery diagnostics; all task/recovery scores come from HandoffBench."""

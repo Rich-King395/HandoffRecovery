@@ -6,6 +6,7 @@ service is used, and Benchmark source, credentials and result files are untouche
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 from importlib import import_module
 import json
 import os
@@ -18,6 +19,7 @@ from unittest.mock import Mock, patch
 import zlib
 
 from handoff_recovery.core.types import Handoff, LocalInstruction, PublicFrame, VerificationTask
+from handoff_recovery.core.protocols import recovery_task_goal
 from handoff_recovery.executor import ExecutorError, GUIOwlConfiguration, GUIOwlExecutor
 from handoff_recovery.integrations.handoffbench import load_gui_owl_bindings, load_phonebuddy_bindings
 
@@ -75,30 +77,55 @@ class BenchmarkPublicHelpersTests(unittest.TestCase):
 
     def test_real_history_native_coordinates_and_latest_only_recovery_injection(self):
         api = self.bindings.api
+        scopes = ["execution"] * 6 + ["verification"] * 2 + ["execution"] * 6
+        expected_history = []
+        previous_scope = None
         with patch.object(api, "validate_configuration", side_effect=AssertionError("Benchmark .env must not be read")):
-            for index in range(7):
+            for index, scope in enumerate(scopes):
                 local = (LocalInstruction(self.goal, (), "verification", verification=VerificationTask(
                     "Read only the currently displayed time", ("Visible alarm time",), ("Do not edit",)))
-                         if index in (1, 5) else LocalInstruction(self.goal, (), "execution", handoff=Handoff(
+                         if scope == "verification" else LocalInstruction(self.goal, (), "execution", handoff=Handoff(
                              "Correct the time only if necessary", ("Alarm label",), ("09:00 visible",))))
-                previous = list(self.executor._context)
+                if scope != previous_scope:
+                    expected_history = []
+                self.message.content = native({"action": "click", "coordinate": [1000, 1000]}).replace(
+                    "Inspect the visible clock", f"Inspect the visible clock {index}")
                 result = self.executor.decide(self.frame(index), local)
                 self.assertEqual(result["coords"], [55, 111])
                 image = self.executor._context[-1]["image"]
-                native_messages = api.build_messages(image, self.goal, previous)
+                context = ({"scope": scope, "verification": {
+                    "objective": local.verification.objective,
+                    "required_evidence": list(local.verification.required_evidence),
+                    "final_confirmation": False,
+                }} if scope == "verification" else {"scope": scope, "handoff": {
+                    "remaining_objective": local.handoff.remaining_objective,
+                    "completion_conditions": list(local.handoff.completion_conditions),
+                }})
+                layered_goal = recovery_task_goal(self.goal, context)
+                native_messages = api.build_messages(image, layered_goal, expected_history)
                 messages = self.create.call_args.kwargs["messages"]
-                self.assertEqual(messages[:-1], native_messages[:-1])
-                self.assertEqual(messages[-1]["content"][:-1], native_messages[-1]["content"])
+                self.assertEqual(messages, native_messages)
                 self.assertEqual(sum(block["type"] == "image_url" for message in messages
-                                     for block in message["content"]), min(index, 4) + 1)
+                                     for block in message["content"]), min(len(expected_history), 4) + 1)
                 self.assertEqual(messages[0]["content"][0]["text"], api.system_prompt())
-                self.assertIn(self.goal, messages[1]["content"][0]["text"])
+                task_text = messages[1]["content"][0]["text"]
+                self.assertEqual(task_text.count(self.goal), 1)
+                self.assertIn("- [pending] " + ("Visible alarm time" if scope == "verification"
+                                                else "09:00 visible"), task_text)
+                self.assertNotIn("Last action feedback", task_text)
                 self.assertFalse(Path(image.path).exists())
-        self.assertEqual(self.create.call_count, 7)
-        self.assertEqual(len(self.executor._context), 7)
+                expected_history.append({"output": self.message.content, "image": image})
+                for item in expected_history[:-4]:
+                    item["image"] = None
+                self.assertEqual(self.executor._context, expected_history)
+                previous_scope = scope
+        self.assertEqual(self.create.call_count, len(scopes))
+        self.assertEqual(len(self.executor._context), 6)
         self.assertIn("Previous actions:\nStep 1:", self.create.call_args.kwargs["messages"][1]["content"][0]["text"])
 
     def test_native_completion_scope_and_strict_parser(self):
+        self.executor.decide(self.frame(0), LocalInstruction(self.goal, (), "original"))
+        original_history = deepcopy(self.executor._context)
         for scope in ("verification", "execution"):
             local = (LocalInstruction(self.goal, (), scope, verification=VerificationTask(
                 "Inspect time", ("Time shown",), ())) if scope == "verification" else
@@ -108,14 +135,22 @@ class BenchmarkPublicHelpersTests(unittest.TestCase):
                                    ({"action": "terminate", "status": "failure"}, "fail")):
                 self.message.content = native(args)
                 self.assertEqual(self.executor.decide(self.frame(1), local)["action"], expected)
-        before = len(self.executor._context)
-        for raw in ("not native", native({"action": "click", "coordinate": [1001, 500]}),
-                    native({"action": "interact", "text": "Ask user"})):
+        before = deepcopy(self.executor._context)
+        for raw, category in (("not native", "native_parse_error"),
+                              (native({"action": "click", "coordinate": [1001, 500]}), "action_mapping_error"),
+                              (native({"action": "interact", "text": "Ask user"}), "action_mapping_error")):
             self.message.content = raw
-            with self.assertRaises(ExecutorError):
-                self.executor.decide(self.frame(2), LocalInstruction(self.goal, (), "original"))
-            self.assertEqual(len(self.executor._context), before)
-        self.assertEqual(self.create.call_count, 9)
+            with self.assertRaises(ExecutorError) as caught:
+                self.executor.decide(self.frame(2), local)
+            self.assertEqual(caught.exception.category, category)
+            self.assertTrue(caught.exception.recoverable)
+            self.assertEqual(self.executor._context, before)
+        self.message.content = "not native"
+        with self.assertRaises(ExecutorError):
+            self.executor.decide(self.frame(3), LocalInstruction(self.goal, (), "original"))
+        self.assertEqual(self.executor._context, original_history)
+        self.assertEqual(self.executor._contexts["execution"], before)
+        self.assertEqual(self.create.call_count, 11)
 
     def test_phonebuddy_parser_accepts_simulated_completion_check(self):
         bindings = load_phonebuddy_bindings(self.root)

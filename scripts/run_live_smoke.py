@@ -18,9 +18,10 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from handoff_recovery.core.types import MAX_CONFIGURED_TOTAL_DECISIONS
-
-MAX_CONFIGURED_DECISIONS = MAX_CONFIGURED_TOTAL_DECISIONS
+from handoff_recovery.core.types import DEFAULT_TOTAL_DECISIONS
+from handoff_recovery.core.protocols import GUI_AGENT_ERROR_CATEGORIES, error_metadata
+from handoff_recovery.core.coordinator import LifecycleError
+from handoff_recovery.executor.condition_updates import experiment_metadata
 
 
 def write(path, value):
@@ -77,9 +78,9 @@ def parse_args(argv=None):
     parser.add_argument("--planner-debug-response-dir", type=Path,
                         help="Opt-in local directory for raw Planner response diagnostics")
     parser.add_argument("--planner-direct", action="store_true", help="Disable environment proxy for planner only")
-    parser.add_argument("--max-decisions", type=int, default=20,
-                        help="Shared local GUI decision budget for this run (default 20, maximum 200)")
-    parser.add_argument("--local-agent", choices=["gui_owl", "phonebuddy", "qwen", "deepseek", "openai", "claude", "ui_voyager", "holo"], default="gui_owl")
+    parser.add_argument("--max-decisions", type=int, default=DEFAULT_TOTAL_DECISIONS,
+                        help=f"Shared local GUI decision budget for this run (positive integer, default {DEFAULT_TOTAL_DECISIONS})")
+    parser.add_argument("--local-agent", choices=["gui_owl", "phonebuddy", "qwen", "deepseek", "openai", "claude", "ui_voyager", "holo", "ui_venus", "openmobile", "mai_gym", "qwen35", "lfm25_vl"], default="gui_owl")
     parser.add_argument("--executor-adapter",
                         help="GUI Agent registry name or module:factory path; defaults to --local-agent")
     parser.add_argument("--local-base-url", default="")
@@ -89,24 +90,73 @@ def parse_args(argv=None):
     parser.add_argument("--local-total-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--local-proxy-mode", default="environment")
     parser.add_argument("--local-max-output-tokens", type=int, default=4096)
+    parser.add_argument("--recovery-history-mode", choices=("isolated", "original_snapshot"),
+                        default="isolated",
+                        help="Native history at recovery entry; default isolates recovery from pre-takeover history")
+    parser.add_argument("--configuration-source", default="explicit_executor_spec",
+                        choices=("explicit_executor_spec", "handoffbench_provider_validate_configuration"))
     parser.add_argument("--local-prompt-path", type=Path,
                         help="PhoneBuddy pinned prompt path (optional)")
-    parser.add_argument("--disable-structured-progress", action="store_true",
-                        help="A/B control: omit the compact pre-handoff progress summary")
     parser.add_argument("--disable-completion-check", action="store_true",
                         help="A/B control: omit and do not enforce recovery completion_check")
+    parser.add_argument("--enable-completion-check", action="store_true",
+                        help="Enable recovery completion_check (default: disabled)")
+    parser.add_argument("--recovery-constraints", choices=("enabled", "disabled"),
+                        default="disabled",
+                        help="Whether Planner constraints are rendered in the GUI Agent recovery prompt (default: disabled)")
+    parser.add_argument("--recovery-uncertain", choices=("enabled", "disabled"),
+                        default="disabled",
+                        help="Whether Planner uncertain progress is rendered in the GUI Agent recovery prompt (default: disabled)")
+    parser.add_argument("--condition-updates", choices=("enabled", "disabled"),
+                        help="Independent condition-claim switch; omitted preserves existing adapter behavior")
+    parser.add_argument("--completion-policy", choices=("conditions", "native"), default="conditions",
+                        help="Recovery termination: existing condition gate or native model completion")
+    parser.add_argument("--condition-update-policy", choices=("host", "model_claim"),
+                        default="model_claim",
+                        help="Who marks model-claimed recovery conditions satisfied; default model_claim")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+    if args.local_agent == "mai_gym":
+        supplied = {arg.split("=", 1)[0] for arg in (sys.argv[1:] if argv is None else argv)}
+        if (args.configuration_source == "explicit_executor_spec"
+                and "--local-max-output-tokens" not in supplied):
+            parser.error("MAIGym requires an explicit --local-max-output-tokens")
+        if "--local-timeout-seconds" not in supplied:
+            args.local_timeout_seconds = 600.0
+        if "--local-total-timeout-seconds" not in supplied:
+            args.local_total_timeout_seconds = 600.0
+    if args.local_agent == "openmobile":
+        supplied = {arg.split("=", 1)[0] for arg in (sys.argv[1:] if argv is None else argv)}
+        if (args.configuration_source == "explicit_executor_spec"
+                and "--local-max-output-tokens" not in supplied):
+            parser.error("OpenMobile requires an explicit --local-max-output-tokens")
+        if "--local-timeout-seconds" not in supplied:
+            args.local_timeout_seconds = 300.0
+        if "--local-total-timeout-seconds" not in supplied:
+            args.local_total_timeout_seconds = 300.0
+    if args.local_agent == "ui_venus" and not any(
+            arg.split("=", 1)[0] == "--local-max-output-tokens"
+            for arg in (sys.argv[1:] if argv is None else argv)):
+        args.local_max_output_tokens = 16384
+    if args.local_agent in {"ui_venus", "openmobile", "mai_gym"} and (args.condition_updates != "disabled"
+            or args.completion_policy != "native" or args.enable_completion_check):
+        parser.error(("UI-Venus" if args.local_agent == "ui_venus" else "MAIGym" if args.local_agent == "mai_gym" else "OpenMobile")
+                     + " requires --condition-updates disabled --completion-policy native without completion_check")
+    if args.completion_policy == "native" and args.enable_completion_check:
+        parser.error("--completion-policy native cannot enable completion_check")
+    if (args.condition_updates == "disabled" and args.completion_policy == "conditions"
+            and args.condition_update_policy == "model_claim" and not args.enable_completion_check):
+        parser.error("Disabled condition updates need --completion-policy native, host claims, or completion_check")
+    if args.disable_completion_check and args.enable_completion_check:
+        parser.error("--disable-completion-check and --enable-completion-check are mutually exclusive")
     if not 1 <= len(args.instances) <= 3 or len(set(args.instances)) != len(args.instances):
         parser.error("Choose one to three distinct public instances for this smoke entry")
     if args.mode == "takeover" and not all((args.credentials_file, args.planner_endpoint, args.planner_model)):
         parser.error("takeover requires --credentials-file, --planner-endpoint and --planner-model")
     if args.local_agent != "qwen" and not args.local_base_url:
         parser.error("--local-base-url is required for this local agent")
-    if not 1 <= args.max_decisions <= MAX_CONFIGURED_DECISIONS:
-        parser.error(
-            f"--max-decisions must be an integer from 1 to {MAX_CONFIGURED_DECISIONS}"
-        )
+    if args.max_decisions < 1:
+        parser.error("--max-decisions must be a positive integer")
     if args.local_timeout_seconds <= 0 or args.local_total_timeout_seconds <= 0:
         parser.error("local timeouts must be positive")
     if args.local_max_output_tokens < 1:
@@ -130,10 +180,9 @@ class LoggedPlanner:
         except Exception as exc:
             # These clients sanitize errors; retain the type in smoke summaries.
             status = getattr(exc, "http_status", None)
-            error = {"type": type(exc).__name__}
-            category = getattr(exc, "category", None)
-            if isinstance(category, str) and category.isidentifier():
-                error["category"] = category
+            metadata = error_metadata(exc, default_category="planner_error", source="planner")
+            error = {"type": metadata["error_type"], "category": metadata["error_category"],
+                     "error_class": metadata["error_class"]}
             if type(status) is int:
                 error["http_status"] = status
             self.errors.append(error)
@@ -178,6 +227,15 @@ def main(argv=None):
     elif args.local_agent == "ui_voyager":
         from handoff_recovery.integrations.handoffbench.loader import load_ui_voyager_bindings
         load_ui_voyager_bindings(bench)
+    elif args.local_agent == "mai_gym":
+        from handoff_recovery.integrations.handoffbench.loader import load_mai_gym_bindings
+        load_mai_gym_bindings(bench)
+    elif args.local_agent == "openmobile":
+        from handoff_recovery.integrations.handoffbench.loader import load_openmobile_bindings
+        load_openmobile_bindings(bench)
+    elif args.local_agent == "ui_venus":
+        from handoff_recovery.integrations.handoffbench.loader import load_ui_venus_bindings
+        load_ui_venus_bindings(bench)
     elif args.local_agent == "holo":
         from handoff_recovery.integrations.handoffbench.loader import load_holo_bindings
         load_holo_bindings(bench)
@@ -210,6 +268,8 @@ def main(argv=None):
         "qwen": "DASHSCOPE_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
         "openai": "OPENAI_API_KEY", "claude": "CLAUDE_API_KEY",
         "ui_voyager": "UI_VOYAGER_API_KEY", "holo": "HOLO_API_KEY",
+        "ui_venus": "UI_VENUS_API_KEY", "openmobile": "OPENMOBILE_API_KEY", "mai_gym": "MAI_GYM_API_KEY",
+        "qwen35": "QWEN35_API_KEY", "lfm25_vl": "LFM25_VL_API_KEY",
     }[args.local_agent]
     local_key = values.get(local_key_var) or "EMPTY"
     cloud_config = (PlannerConfig(endpoint=args.planner_endpoint, model=args.planner_model,
@@ -225,8 +285,29 @@ def main(argv=None):
         total_timeout_seconds=args.local_total_timeout_seconds,
         proxy_mode=args.local_proxy_mode,
         max_tokens=args.local_max_output_tokens,
-                    enable_completion_check=(args.local_agent == "phonebuddy"
-                                 and not args.disable_completion_check))
+        configuration_source=args.configuration_source,
+        recovery_history_mode=args.recovery_history_mode,
+        include_recovery_constraints=(args.recovery_constraints == "enabled"),
+        include_recovery_uncertain=(args.recovery_uncertain == "enabled"),
+                    enable_completion_check=bool(args.enable_completion_check))
+    if (args.configuration_source == "handoffbench_provider_validate_configuration"
+            and args.local_agent in {"gui_owl", "phonebuddy", "ui_voyager", "holo", "ui_venus", "openmobile", "mai_gym"}):
+        from dataclasses import replace
+        from handoff_recovery.executor.registry import load_local_configuration
+        selected = load_local_configuration(bench, args.local_agent)
+        local_config = replace(local_config, api_key=selected.api_key, model=selected.model,
+            base_url=selected.base_url, timeout_seconds=selected.timeout_seconds,
+            max_tokens=selected.max_tokens,
+            prompt_path=getattr(selected, "prompt_path", None))
+    elif args.local_agent in {"qwen35", "lfm25_vl"}:
+        from dataclasses import replace
+        from handoff_recovery.integrations.handoffbench.loader import load_cloud_bindings
+        selected = load_cloud_bindings(bench, args.local_agent).validate_configuration()
+        local_config = replace(local_config, api_key=selected.api_key, model=selected.model,
+            base_url=selected.base_url, timeout_seconds=selected.timeout_seconds,
+            total_timeout_seconds=selected.total_timeout_seconds, proxy_mode=selected.proxy_mode,
+            max_tokens=selected.max_output_tokens,
+            configuration_source="handoffbench_provider_validate_configuration")
     del values, cloud_key, local_key
     def make_planner():
         return (create_planner(args.planner_adapter, cloud_config)
@@ -276,16 +357,37 @@ def main(argv=None):
         if args.local_agent == "qwen":
             source_paths.extend((bench / "resumebench/models/qwen_model.py",
                                  bench / "resumebench/models/qwen_transport.py"))
+        if args.local_agent in {"qwen35", "lfm25_vl"}:
+            source_paths.extend((bench / "resumebench/agents/local_vlm.py",
+                                 bench / "resumebench/models/local_vlm.py"))
+    if args.local_agent == "mai_gym":
+        source_paths.extend(bench / "resumebench/models/prompts" / name for name in (
+            "mai_gym_mobile_use_windows_wise_system.j2", "mai_gym_source.json"))
+    if args.local_agent == "openmobile":
+        source_paths.extend(bench / "resumebench/models/prompts" / name for name in (
+            "openmobile_2_system.txt", "openmobile_2_source.json"))
+    if args.local_agent == "ui_venus":
+        source_paths.extend(bench / "resumebench/models/prompts" / name for name in (
+            "ui_venus_2_system.txt", "ui_venus_2_source.json"))
     sources = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths if path.is_file()}
     summary = {"scope": "real_models_public_runner_functional_smoke_not_full_evaluation",
         "started_at": datetime.now(timezone.utc).isoformat(), "device": args.device,
         "appium_url": args.appium_url, "baseline_id": manifest["baseline_id"],
         "mode": args.mode, "planner": _descriptor(make_planner(), args.planner_adapter),
-        "executor": {"agent": args.local_agent, "model": args.local_model,
+        "executor": {"agent": args.local_agent, "model": local_config.model,
                       "adapter": executor_adapter,
-                      "base_url": args.local_base_url,
-                      "completion_check_enabled": bool(
-                          args.local_agent == "phonebuddy" and not args.disable_completion_check)},
+                      "base_url": local_config.base_url,
+                      "configuration_source": local_config.configuration_source,
+                      **({"timeout_seconds": local_config.timeout_seconds,
+                          "max_output_tokens": local_config.max_tokens}
+                         if args.local_agent in {"gui_owl", "phonebuddy", "ui_voyager", "holo", "ui_venus", "openmobile", "mai_gym", "qwen35", "lfm25_vl"} else {}),
+                      "recovery_history_mode": args.recovery_history_mode,
+                      "recovery_constraints": args.recovery_constraints,
+                      "recovery_uncertain": args.recovery_uncertain,
+                      "condition_update_policy": args.condition_update_policy,
+                      **experiment_metadata(args.condition_updates, args.local_agent, args.completion_policy),
+                      "completion_policy": args.completion_policy,
+                      "completion_check_enabled": bool(args.enable_completion_check)},
         "max_decisions": args.max_decisions, "sources": sources, "trials": []}
     write(output / "summary.json", summary)
     print(f"Results: {output}", flush=True)
@@ -322,8 +424,11 @@ def main(argv=None):
                     write(output / "summary.json", summary)
                 agent = HandoffRecoveryAgent(
                     bench_path=bench, planner=planner, executor=executor,
-                    include_prior_progress=not args.disable_structured_progress,
-                    action_validator=getattr(executor, "validate_action", None))
+                    action_validator=getattr(executor, "validate_action", None),
+                    condition_update_policy=args.condition_update_policy,
+                    completion_policy=args.completion_policy,
+                    condition_updates_enabled=(None if args.condition_updates is None
+                                               else args.condition_updates == "enabled"))
                 print(f"Instance {number}: restoring baseline", flush=True)
                 backend.set_task_context(task["id"])
                 restored = manager.restore(case / "restore", reason="handoff_recovery_functional_smoke",
@@ -378,20 +483,56 @@ def main(argv=None):
                 item["status"] = ("collected" if result["termination_reason"] in
                     {"agent_done", "agent_failed", "budget_exhausted"} else "error")
             except Exception as exc:
-                item.update(status="error", error_type=type(exc).__name__)
+                category = getattr(exc, "category", None)
+                if isinstance(exc, LifecycleError):
+                    source = "lifecycle"
+                elif isinstance(category, str) and (category in GUI_AGENT_ERROR_CATEGORIES
+                                                    or category == "integration_error"):
+                    # The public bridge re-raises a sanitized GUI Agent error;
+                    # preserve its protocol category instead of treating it as
+                    # an Appium/environment failure.
+                    source = "executor"
+                elif isinstance(category, str) and category in {
+                        "planner_error", "plan_validation_error",
+                        "planner_unavailable_or_invalid"}:
+                    source = "planner"
+                else:
+                    source = "environment"
+                metadata = error_metadata(exc, default_category=(
+                    "lifecycle_error" if source == "lifecycle" else
+                    "executor_contract_error" if source == "executor" else
+                    "planner_error" if source == "planner" else "environment_error"),
+                    source=source)
+                item.update(status="error", error_type=metadata["error_type"],
+                            error_category=metadata["error_category"],
+                            error_class=metadata["error_class"],
+                            error_message=str(exc)[:240])
                 print(f"Instance {number}: {type(exc).__name__}", flush=True)
             finally:
                 if device is not None:
                     try:
                         device.close()
                     except Exception as exc:
-                        item.update(status="error", cleanup_error_type=type(exc).__name__)
+                        metadata = error_metadata(exc, default_category="environment_error",
+                                                  source="environment")
+                        item.update(status="error", cleanup_error_type=metadata["error_type"],
+                                    cleanup_error_category=metadata["error_category"],
+                                    cleanup_error_class=metadata["error_class"])
                 recovery = (agent.report() if agent is not None and agent.coordinator is not None else
                             {"scope": "handoffbench_public_protocol", "phase": "not_started",
                              "task_success": None})
                 write(case / "recovery.json", recovery)
+                if recovery.get("error_category") and not item.get("error_category"):
+                    item["error_category"] = recovery["error_category"]
+                if recovery.get("error_class") and not item.get("error_class"):
+                    item["error_class"] = recovery["error_class"]
+                if recovery.get("error_type") and not item.get("error_type"):
+                    item["error_type"] = recovery["error_type"]
                 item.update(seconds=round(time.monotonic() - started, 3), cloud_request_attempts=planner.attempts,
-                            cloud_error_types=planner.errors)
+                            cloud_errors=planner.errors,
+                            cloud_error_types=[error.get("type") for error in planner.errors],
+                            cloud_error_categories=[error.get("category") for error in planner.errors],
+                            cloud_error_classes=[error.get("error_class") for error in planner.errors])
                 result = item.get("benchmark_result", {})
                 item["flow_passed"] = bool(item["status"] == "collected"
                     and result.get("evaluation_status") == "ok"

@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 from handoff_recovery.core.types import (
-    OwnAction, PlanRequest, PublicFrame, SlimPlan, VerificationTask,
+    OwnAction, PlanRequest, PublicFrame, SlimPlan, VerificationTask, sanitize_progress,
 )
 from handoff_recovery.planner import (
     OpenAICompatiblePlanner, PlannerConfig, PlannerError, PlanValidationError,
@@ -36,13 +36,14 @@ def request(**changes):
                 PublicFrame("after_return", PNG, 1, 1, "Fresh observation after return.")),
         current_frame_id="after_return", decisions_used=1, decisions_remaining=19,
         verification_rounds_remaining=1, cloud_calls_remaining_after_this=1,
-        pre_handoff_frame_id="pre_handoff",
+        pre_handoff_frame_id="pre_handoff", total_decisions=20,
     )
     return replace(original, **changes)
 
 
 def execute():
     return {
+        "progress": {"confirmed": ["The sample contact detail is visible."], "uncertain": []},
         "decision": "EXECUTE", "reason": "The supplied current image supports a complete remaining goal.",
         "facts": [{"claim": "The sample contact detail is visible.", "scope": "current", "evidence_ids": ["after_return"]}],
         "unknowns": [], "verification": None,
@@ -76,16 +77,44 @@ def envelope(plan=None, **changes):
 
 
 class PlanValidationTests(unittest.TestCase):
+    def test_progress_is_host_sanitized_and_uncertain_facts_are_reclassified(self):
+        progress = sanitize_progress({
+            "confirmed": [
+                "The contact screen is open.",
+                "The contact screen is open and the email field is visible.",
+                "I think the email is saved.",
+                "The email is likely saved.",
+                "Click save now.",
+                "The email is not confirmed.",
+                "Because the field is visible, it should be saved.",
+            ],
+            "uncertain": [
+                "The saved email requires verification.",
+                "We can probably infer the phone is unchanged.",
+            ],
+        })
+        self.assertEqual(progress.confirmed, ("The contact screen is open.",))
+        self.assertEqual(progress.uncertain, ("The email is not confirmed.",
+                                              "The saved email requires verification."))
+
+    def test_progress_is_bounded(self):
+        progress = sanitize_progress({
+            "confirmed": [f"Fact {index}" for index in range(20)],
+            "uncertain": [],
+        })
+        self.assertEqual(len(progress.confirmed), 8)
+        self.assertTrue(all(len(item) <= 160 for item in progress.confirmed))
+
     def test_slim_plan_branches_and_local_budget_validation(self):
         execute_value = {
+            "completion_status": "INCOMPLETE",
             "decision": "EXECUTE", "objective": "Set the saved email.",
             "completion_conditions": ["The saved email is visible."],
-            "constraints": ["Keep the phone number."],
         }
         verify_value = {
+            "completion_status": "INCOMPLETE",
             "decision": "VERIFY", "objective": "Inspect the saved email.",
             "completion_conditions": ["The saved email is visible."],
-            "constraints": ["Do not edit or save."],
         }
         for value in (execute_value, verify_value):
             plan = parse_plan(json.dumps(value), request())
@@ -94,15 +123,41 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaises(PlanValidationError):
             parse_plan(json.dumps(verify_value), request(verification_rounds_remaining=0))
 
+    def test_failed_verification_forces_execute_or_fallback(self):
+        complete_verify = {
+            "completion_status": "COMPLETE",
+            "decision": "VERIFY",
+            "objective": "Confirm the final state.",
+            "completion_conditions": ["The final state is visible."],
+        }
+        execute_value = {
+            "completion_status": "INCOMPLETE",
+            "decision": "EXECUTE",
+            "objective": "Finish the remaining work.",
+            "completion_conditions": ["The final state is visible."],
+        }
+        failed_request = request(
+            verification=VerificationTask("Confirm the final state.",
+                                          ("The final state is visible.",),
+                                          ("Read only.",)),
+            verification_report="Verification executor reported it could not complete the check.",
+            verification_failed=True,
+            verification_rounds_remaining=0,
+            cloud_calls_remaining_after_this=0,
+        )
+        with self.assertRaises(PlanValidationError):
+            parse_plan(json.dumps(complete_verify), failed_request)
+        self.assertEqual(parse_plan(json.dumps(execute_value), failed_request).decision, "EXECUTE")
+
     def test_slim_plan_rejects_legacy_fields_and_empty_execution_conditions(self):
         value = {"decision": "EXECUTE", "objective": "Do it.",
-                 "completion_conditions": [], "constraints": []}
+                 "completion_status": "INCOMPLETE", "completion_conditions": []}
         with self.assertRaises(PlanValidationError):
             parse_plan(json.dumps(value), request())
 
     def test_slim_fallback_is_reserved_for_unreliable_guidance(self):
         value = {"decision": "FALLBACK", "objective": "Resume the original task from the current state.",
-                 "completion_conditions": [], "constraints": []}
+                 "completion_conditions": [], "completion_status": "UNVERIFIABLE"}
         plan = parse_plan(json.dumps(value), request())
         self.assertIsInstance(plan, SlimPlan)
         public = json.loads(build_messages(request())[1]["content"][0]["text"])
@@ -120,19 +175,11 @@ class PlanValidationTests(unittest.TestCase):
                 self.assertEqual(plan.decision, value["decision"])
                 self.assertEqual(validate_plan(plan, request()), plan)
 
-    def test_execute_supports_local_inspection_and_conditional_actions(self):
+    def test_execute_rejects_removed_inspection_and_conditional_fields(self):
         value = execute()
         value["handoff"]["inspect_before_action"] = ["Open Appearance and read the explicit theme value."]
-        value["handoff"]["conditional_actions"] = [{
-            "when": "The theme is Light.",
-            "then": "Select Dark and return to the weather page.",
-        }]
-        plan = parse_plan(json.dumps(value), request())
-        self.assertEqual(plan.handoff.inspect_before_action,
-                         ("Open Appearance and read the explicit theme value.",))
-        self.assertEqual(plan.handoff.conditional_actions[0].when, "The theme is Light.")
-        self.assertEqual(plan.handoff.conditional_actions[0].then,
-                         "Select Dark and return to the weather page.")
+        with self.assertRaises(PlanValidationError):
+            parse_plan(json.dumps(value), request())
 
     def test_rejects_json_wrappers_duplicates_and_nonfinite_constants(self):
         good = json.dumps(execute())
@@ -170,6 +217,37 @@ class PlanValidationTests(unittest.TestCase):
         for value in cases:
             with self.subTest(value=value), self.assertRaises(PlanValidationError):
                 parse_plan(json.dumps(value), request())
+
+    def test_object_shapes_keep_error_messages_categories_and_validation_order(self):
+        shape_error = ("Missing, unexpected, or invalid object fields", "object_shape")
+        slim = {"decision": "EXECUTE", "objective": "Set the saved email.",
+                "completion_conditions": ["The saved email is visible."],
+                "completion_status": "INCOMPLETE"}
+        cases = [(value, *shape_error) for value in (None, [], "text", 1)]
+        for original in (execute(), slim):
+            for name in original:
+                value = dict(original, decision="UNKNOWN")
+                del value[name]
+                cases.append((value, *shape_error))
+            cases.append((dict(original, decision="UNKNOWN", extra=None), *shape_error))
+        for progress in (None, [], {}, {"confirmed": []}, {"uncertain": []},
+                         {"confirmed": None, "uncertain": [], "extra": []}):
+            cases.append((dict(execute(), progress=progress), *shape_error))
+        cases.extend([
+            (dict(execute(), progress={"confirmed": None, "uncertain": None}),
+             "Expected a text array", "text_array"),
+            (dict(execute(), progress={"confirmed": [""], "uncertain": None}),
+             "Expected a nonempty text field", "text_field"),
+            (dict(execute(), handoff=None, progress=None),
+             "Expected an execution handoff object", "handoff_type"),
+        ])
+        for value, message, category in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(PlanValidationError) as caught:
+                    parse_plan(json.dumps(value), request())
+                self.assertEqual(str(caught.exception), message)
+                self.assertEqual(caught.exception.category, category)
+                self.assertIsNone(caught.exception.__cause__)
 
     def test_current_claim_needs_post_return_frame(self):
         for ids in (["action_1"], ["pre_handoff"], ["pre_handoff", "action_1"], ["private_scorer"], []):
@@ -222,14 +300,26 @@ class PlanValidationTests(unittest.TestCase):
 class PromptTests(unittest.TestCase):
     def test_sends_actual_images_labels_and_public_fields_only(self):
         req = request()
+        object.__setattr__(req, "history", (
+            OwnAction(1, {"action": "click", "target": "saved button"},
+                      "original", "pre_handoff", result="success"),
+            OwnAction(2, {"action": "swipe", "target": "list"},
+                      "original", "after_return", result="failed"),
+            OwnAction(3, {"action": "tap", "target": "unknown button"},
+                      "original", "after_return"),
+        ))
         object.__setattr__(req, "private_event", "DO_NOT_SEND_HIDDEN_SENTINEL")
         messages = build_messages(req)
         self.assertEqual([message["role"] for message in messages], ["system", "user"])
         content = messages[1]["content"]
         public = json.loads(content[0]["text"])
         self.assertEqual(public["original_task_verbatim"], req.original_goal)
-        self.assertEqual(public["public_constraints"], list(req.public_constraints))
-        self.assertEqual(public["own_action_history"][0]["evidence_id"], "action_1")
+        self.assertNotIn("public_constraints", public)
+        self.assertNotIn("control_event", public)
+        self.assertNotIn("budget", public)
+        self.assertEqual(public["own_action_history"], [
+            {"action": "click", "target": "saved button"},
+        ])
         self.assertIn("before action_1", public["images"][0]["observation_note"])
         self.assertEqual(public["pre_handoff_frame_id"], "pre_handoff")
         image_parts = [item for item in content if item["type"] == "image_url"]
@@ -239,6 +329,12 @@ class PromptTests(unittest.TestCase):
             self.assertTrue(url.startswith("data:image/png;base64,"))
             self.assertEqual(base64.b64decode(url.split(",", 1)[1]), PNG)
         self.assertNotIn("DO_NOT_SEND_HIDDEN_SENTINEL", json.dumps(messages))
+
+    def test_system_prompt_does_not_describe_removed_planner_fields(self):
+        system_text = build_messages(request())[0]["content"]
+        self.assertNotIn("public constraints", system_text.lower())
+        self.assertNotIn("public budget", system_text.lower())
+        self.assertNotIn("use_prior_progress", system_text)
 
     def test_verification_report_is_labeled_unverified_with_latest_frame(self):
         task = VerificationTask("Inspect saved fields.", ("Saved fields.",), ("Do not edit.",))
@@ -292,15 +388,13 @@ class PlannerClientTests(unittest.TestCase):
         self.assertTrue(response_format["json_schema"]["strict"])
         schema = response_format["json_schema"]["schema"]
         self.assertEqual(schema["required"],
-                         ["decision", "objective", "completion_conditions", "constraints"])
+                         ["completion_status", "decision", "objective", "completion_conditions"])
         self.assertFalse(schema["additionalProperties"])
         properties = schema["properties"]
         self.assertEqual(properties["objective"], {"type": "string"})
         self.assertEqual(properties["completion_conditions"],
                          {"type": "array", "items": {"type": "string"}})
-        self.assertEqual(properties["constraints"],
-                         {"type": "array", "items": {"type": "string"}})
-        self.assertEqual(properties["use_prior_progress"], {"type": "boolean"})
+        self.assertNotIn("use_prior_progress", properties)
         self.assertNotIn("SECRET_TEST_TOKEN", json.dumps(payload))
         self.assertEqual(result.usage, {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7})
         self.assertGreaterEqual(result.elapsed_seconds, 0)
@@ -339,9 +433,9 @@ class PlannerClientTests(unittest.TestCase):
 
     def test_plan_diagnostic_identifies_nested_shape(self):
         value = execute()
-        value["handoff"]["conditional_actions"] = [{"when": "x", "then": "y", "extra": "z"}]
+        value["handoff"]["unexpected"] = "removed"
         diagnostic = diagnose_plan_text(json.dumps(value))
-        self.assertEqual(diagnostic["nested_shape"]["location"], "handoff.conditional_actions[0]")
+        self.assertEqual(diagnostic["nested_shape"]["location"], "handoff")
 
     def test_thinking_option_is_explicit_and_absent_by_default(self):
         for value in (None, False, True):

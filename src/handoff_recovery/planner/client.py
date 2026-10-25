@@ -13,35 +13,18 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from handoff_recovery.core.types import PlanReply, PlanRequest
+from .contracts import response_format
 from .prompt import build_messages
 from .validation import PlanValidationError, diagnose_plan_text, parse_plan, strict_json
 
 
 def _planner_response_format() -> dict[str, Any]:
-    """Return the four-field SlimPlan schema.
+    """Return the minimal Planner decision schema.
 
     The endpoint only enforces the small wire envelope; validation.py remains
     authoritative for branch semantics and budget rules.
     """
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "handoff_recovery_plan",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "decision": {"type": "string", "enum": ["VERIFY", "EXECUTE", "FALLBACK"]},
-                    "objective": {"type": "string"},
-                    "completion_conditions": {"type": "array", "items": {"type": "string"}},
-                    "constraints": {"type": "array", "items": {"type": "string"}},
-                    "use_prior_progress": {"type": "boolean"},
-                },
-                "required": ["decision", "objective", "completion_conditions", "constraints"],
-                "additionalProperties": False,
-            },
-        },
-    }
+    return response_format()
 
 
 class PlannerError(RuntimeError):

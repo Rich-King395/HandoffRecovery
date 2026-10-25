@@ -6,15 +6,7 @@ import json
 from typing import Any
 
 from handoff_recovery.core.types import PlanRequest
-
-
-OUTPUT_CONTRACT = {
-    "decision": "VERIFY | EXECUTE | FALLBACK",
-    "objective": "one complete remaining task or bounded verification task",
-    "completion_conditions": ["observable conditions for finishing the objective"],
-    "constraints": ["public preservation and safety constraints"],
-    "use_prior_progress": "boolean; true only when unverified historical action attempts are needed",
-}
+from .contracts import OUTPUT_CONTRACT
 
 
 def build_messages(request: PlanRequest) -> list[dict[str, Any]]:
@@ -22,19 +14,10 @@ def build_messages(request: PlanRequest) -> list[dict[str, Any]]:
     verification = request.verification
     public = {
         "original_task_verbatim": request.original_goal,
-        "public_constraints": list(request.public_constraints),
-        "control_event": "Control has returned. No takeover-period actions or images are available.",
-        "budget": {
-            "total_local_decisions": request.total_decisions,
-            "decisions_used": request.decisions_used,
-            "decisions_remaining": request.decisions_remaining,
-            "verification_rounds_remaining": request.verification_rounds_remaining,
-            "cloud_calls_remaining_after_this": request.cloud_calls_remaining_after_this,
-        },
         "own_action_history": [
-            {"evidence_id": f"action_{item.decision_number}", "decision_number": item.decision_number,
-             "action_attempt": item.action, "scope": item.scope, "observed_frame_before_action": item.frame_id}
-            for item in request.history
+            {"action": item.action.get("action", "unknown"),
+             "target": item.action.get("target", "")}
+            for item in request.history if item.result == "success"
         ],
         "images": [
             {"evidence_id": frame.evidence_id, "width": frame.width, "height": frame.height,
@@ -47,21 +30,21 @@ def build_messages(request: PlanRequest) -> list[dict[str, Any]]:
         "verification_update": None if verification is None else {
             "requested_objective": verification.objective,
             "required_evidence": list(verification.required_evidence),
-            "constraints": list(verification.constraints),
             "executor_report_unverified": request.verification_report,
         },
+        "verification_failed": request.verification_failed,
         "output_field_contract": OUTPUT_CONTRACT,
         "branch_constraints": (
-            "Return the four required fields and optional use_prior_progress. decision must be EXECUTE, VERIFY, or FALLBACK. "
+            "Return exactly the four required fields. completion_status must be COMPLETE, INCOMPLETE, or UNVERIFIABLE. "
+            "COMPLETE must choose VERIFY; UNVERIFIABLE cannot choose EXECUTE. decision must be EXECUTE, VERIFY, or FALLBACK. "
             "For EXECUTE, objective describes all remaining work and completion_conditions describe observable "
-            "final state. If the task appears complete, return EXECUTE with an objective to confirm the final state "
+            "conditions covering the ORIGINAL task's final state, including its required values. If the task appears complete, return EXECUTE with an objective to confirm the final state "
             "and finish; do not use FALLBACK for a completed task. For VERIFY, objective describes one bounded "
-            "read-only check and completion_conditions describe the evidence that must be observed. constraints "
-            "must preserve the original task and prevent unsafe changes. Use FALLBACK only when reliable guidance "
-            "cannot be formed; its objective must say to resume the original task and both arrays may be empty. "
-            "Set use_prior_progress to true only when the current evidence and recovery objective are insufficient "
-            "without knowing which original actions were attempted; otherwise set it to false. The current screenshot "
-            "is authoritative either way. Do not return facts, unknowns, evidence IDs, reasons, Markdown, or surrounding commentary."
+            "read-only check and completion_conditions describe only the evidence that must be observed. "
+            "A COMPLETE assessment uses one final read-only confirmation. If verification_failed is true, "
+            "completion_status cannot be COMPLETE and the decision must be EXECUTE or FALLBACK; do not request another VERIFY. Use FALLBACK only when reliable guidance "
+            "cannot be formed; its objective must say to resume the original task. The current screenshot "
+            "is authoritative. Return no extra fields, evidence IDs, reasons, Markdown, or surrounding commentary."
         ),
     }
     content: list[dict[str, Any]] = [{"type": "text", "text": json.dumps(public, ensure_ascii=False, allow_nan=False)}]

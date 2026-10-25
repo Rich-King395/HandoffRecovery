@@ -39,7 +39,6 @@ def execute_reply(**kwargs):
             CONSTRAINTS,
             ("The contact details visibly show the requested saved email.",),
         ),
-        use_prior_progress=True,
     ), **kwargs)
 
 
@@ -79,7 +78,6 @@ def slim_execute_reply():
     return PlanReply(SlimPlan(
         "EXECUTE", "Fill the requested email and save the same contact.",
         ("The saved contact visibly shows the requested email.",),
-        CONSTRAINTS,
     ))
 
 
@@ -87,7 +85,14 @@ def slim_verify_reply():
     return PlanReply(SlimPlan(
         "VERIFY", "Open the contact details and inspect the saved email.",
         ("A visible contact details screen showing the email.",),
-        ("Read only; do not change or save business data.",),
+    ))
+
+
+def slim_complete_verify_reply():
+    return PlanReply(SlimPlan(
+        "VERIFY", "The original task appears complete; verify the final state.",
+        ("The saved contact visibly shows the requested email.",),
+        completion_status="COMPLETE",
     ))
 
 
@@ -112,13 +117,14 @@ class FakeExecutor:
 
 
 class CoordinatorTests(unittest.TestCase):
-    def make_coordinator(self, actions, replies=(), *, requires_completion_check=False, budget=None):
+    def make_coordinator(self, actions, replies=(), *, requires_completion_check=False,
+                         budget=None, condition_update_policy="host"):
         planner = FakePlanner(replies)
         executor = FakeExecutor(actions, requires_completion_check=requires_completion_check)
         coordinator = RecoveryCoordinator(
             task_id="synthetic-contact", original_goal=GOAL,
             public_constraints=CONSTRAINTS, planner=planner, executor=executor,
-            budget=budget,
+            budget=budget, condition_update_policy=condition_update_policy,
         )
         return coordinator, planner, executor
 
@@ -166,7 +172,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(executor.starts, [("synthetic-contact", GOAL)])
         self.assertIsNone(coordinator.report()["task_success"])
 
-    def test_execution_instruction_contains_compact_prior_progress(self):
+    def test_execution_instruction_does_not_include_prior_progress(self):
         coordinator, _, executor = self.make_coordinator(
             [{"action": "tap", "coords": [1, 1]}, {"action": "tap", "coords": [2, 2]}],
             [execute_reply()])
@@ -174,31 +180,20 @@ class CoordinatorTests(unittest.TestCase):
         self.return_control(coordinator)
         result = coordinator.step(frame("execution_1"))
         self.assertEqual(result.kind, "action")
-        self.assertEqual(executor.requests[-1][1].prior_progress,
-                         {
-                             "purpose": "orientation_only",
-                             "reliability": "unverified",
-                             "current_state_source": "latest_screenshot",
-                             "attempt_summary": {
-                                 "decision_count": 1,
-                                 "action_types_attempted": ["tap"],
-                             },
-                             "interpretation_rule": (
-                                 "These are attempted actions only. They do not prove that any action "
-                                 "succeeded or describe the current UI state."
-                             ),
-                         })
+        self.assertFalse(hasattr(executor.requests[-1][1], "prior_progress"))
+        self.assertNotIn("prior_progress", vars(executor.requests[-1][1]))
         coordinator.acknowledge_action(success=True)
 
-    def test_execution_omits_prior_progress_without_planner_opt_in(self):
-        coordinator, _, executor = self.make_coordinator(
+    def test_execution_uses_action_results_for_history(self):
+        coordinator, planner, executor = self.make_coordinator(
             [{"action": "tap", "coords": [1, 1]}, {"action": "wait"}],
             [slim_execute_reply()])
         self.run_prefix(coordinator, 1)
         self.return_control(coordinator)
         result = coordinator.step(frame("execution_without_progress"))
         self.assertEqual(result.kind, "action")
-        self.assertIsNone(executor.requests[-1][1].prior_progress)
+        self.assertFalse(hasattr(executor.requests[-1][1], "prior_progress"))
+        self.assertEqual(planner.requests[0].history[-1].result, "success")
 
     def test_repeated_unchanged_actions_remain_executor_responsibility(self):
         coordinator, _, _ = self.make_coordinator(
@@ -250,8 +245,15 @@ class CoordinatorTests(unittest.TestCase):
     def test_direct_handoff_executes_locally_through_done_or_failure(self):
         for final_action, expected in (("done", "task_complete"), ("fail", "agent_failed")):
             with self.subTest(final_action=final_action):
+                first_action = {"action": "wait"}
+                if final_action == "done":
+                    first_action["condition_updates"] = [
+                        {"condition_id": "c1", "status": "satisfied",
+                         "evidence": "The saved email is visible."}
+                    ]
                 coordinator, planner, executor = self.make_coordinator(
-                    [{"action": "wait"}, {"action": final_action}], [execute_reply()])
+                    [first_action, {"action": final_action}], [execute_reply()],
+                    condition_update_policy="model_claim")
                 returned = self.return_control(coordinator)
                 first = coordinator.step(returned)
                 self.assertEqual((first.kind, first.scope), ("action", "execution"))
@@ -265,14 +267,21 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertIsNone(coordinator.report()["task_success"])
 
     def test_slim_execute_plan_is_expanded_for_local_execution(self):
-        coordinator, _, executor = self.make_coordinator([{"action": "done"}], [slim_execute_reply()])
-        result = coordinator.step(self.return_control(coordinator))
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "wait", "condition_updates": [
+                {"condition_id": "c1", "status": "satisfied", "evidence": "Saved email is visible."}
+            ]}, {"action": "done"}], [slim_execute_reply()],
+            condition_update_policy="model_claim")
+        first = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(first.kind, "action")
+        coordinator.acknowledge_action(success=True)
+        result = coordinator.step(frame("slim_execute_done"))
         self.assertEqual((result.kind, result.scope), ("task_complete", "execution"))
         instruction = executor.requests[0][1]
         self.assertEqual(instruction.scope, "execution")
         self.assertEqual(instruction.handoff.remaining_objective,
                          "Fill the requested email and save the same contact.")
-        self.assertEqual(instruction.handoff.preserve, CONSTRAINTS)
+        self.assertEqual(instruction.handoff.preserve, ())
 
     def test_completion_check_allows_recovery_done(self):
         action = {"action": "done", "reason": "verified",
@@ -283,6 +292,10 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result.kind, "task_complete")
         self.assertEqual(coordinator.history[-1].action["completion_check"],
                          self.completion_check())
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": "The saved contact visibly shows the requested email.",
+             "status": "satisfied"}
+        ])
 
     def test_completion_check_rejects_missing_or_incomplete_done(self):
         cases = [
@@ -304,7 +317,6 @@ class CoordinatorTests(unittest.TestCase):
         two_condition_reply = PlanReply(SlimPlan(
             "EXECUTE", "Complete both visible requirements.",
             ("The title is saved.", "The unrelated note is unchanged."),
-            CONSTRAINTS,
         ))
         valid = [
             {"condition_id": "c1", "status": "satisfied", "evidence": "Title is saved."},
@@ -341,6 +353,210 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(instruction.verification.objective,
                          "Open the contact details and inspect the saved email.")
 
+    def test_complete_status_runs_one_final_read_only_confirmation(self):
+        coordinator, planner, executor = self.make_coordinator(
+            [{"action": "done"}], [slim_complete_verify_reply()])
+        returned = self.return_control(coordinator)
+        result = coordinator.step(returned)
+        self.assertEqual(result.kind, "task_complete")
+        self.assertTrue(coordinator.finished)
+        self.assertEqual(len(planner.requests), 1)
+        self.assertEqual(len(executor.requests), 1)
+        self.assertTrue(executor.requests[-1][1].verification.final_confirmation)
+        self.assertEqual(coordinator.report()["termination_reason"], "task_complete")
+
+    def test_failed_complete_verification_replans_without_second_verify(self):
+        coordinator, planner, executor = self.make_coordinator(
+            [{"action": "fail"}, {"action": "wait"}],
+            [slim_complete_verify_reply(), slim_execute_reply()])
+        returned = self.return_control(coordinator)
+        first = coordinator.step(returned)
+        self.assertEqual((first.kind, first.scope), ("verification_failed", "verification"))
+        self.assertFalse(coordinator.finished)
+        second = coordinator.step(frame("after_failed_verify"))
+        self.assertEqual((second.kind, second.scope), ("action", "execution"))
+        self.assertEqual(len(planner.requests), 2)
+        self.assertTrue(planner.requests[1].verification_failed)
+        self.assertEqual(planner.requests[1].verification_rounds_remaining, 0)
+        self.assertEqual(executor.requests[-1][1].scope, "execution")
+
+    def test_recovery_condition_status_is_monotonic_and_passed_to_executor(self):
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "wait"}], [slim_execute_reply()])
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.kind, "action")
+        instruction = executor.requests[-1][1]
+        self.assertEqual(set(instruction.condition_status), {
+            ("The saved contact visibly shows the requested email.", "pending")})
+        coordinator.update_condition_status({
+            "The saved contact visibly shows the requested email.": "satisfied"})
+        with self.assertRaises(ValueError):
+            coordinator.update_condition_status({
+                "The saved contact visibly shows the requested email.": "pending"})
+
+    def test_incremental_condition_claim_waits_for_host_verification(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "tap", "target": "save",
+              "condition_updates": [{"condition_id": "c1", "status": "satisfied",
+                                      "evidence": "Saved email is visible"}]}],
+            [slim_execute_reply()])
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.condition_updates[0]["condition"], condition)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        coordinator.acknowledge_action(success=True, satisfied_conditions=[condition])
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "satisfied"}])
+
+    def test_incremental_condition_claim_rejects_unverifiable_status(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, _ = self.make_coordinator(
+            [{"action": "tap", "target": "save",
+              "condition_updates": [{"condition_id": "c1", "status": "unverifiable",
+                                      "evidence": "The field is obscured"}]}],
+            [slim_execute_reply()])
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.kind, "action")
+        self.assertEqual(result.condition_updates, ())
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        self.assertIn("condition_updates_rejected",
+                      [event["event"] for event in coordinator.report()["events"]])
+
+    def test_model_claim_marks_condition_satisfied_after_successful_action(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "tap", "target": "save",
+              "condition_updates": [{"condition_id": "c1", "status": "satisfied",
+                                      "evidence": "Saved email is visible"}]}],
+            [slim_execute_reply()], condition_update_policy="model_claim")
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.condition_updates[0]["condition"], condition)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        coordinator.acknowledge_action(success=True, model_claimed_conditions=[condition])
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "satisfied"}])
+        self.assertIn("model_condition_claims_applied",
+                      [event["event"] for event in coordinator.report()["events"]])
+
+    def test_model_claim_does_not_mark_condition_after_failed_action(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, _ = self.make_coordinator(
+            [{"action": "tap", "target": "save",
+              "condition_updates": [{"condition_id": "c1", "status": "satisfied",
+                                      "evidence": "Saved email is visible"}]}],
+            [slim_execute_reply()], condition_update_policy="model_claim")
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.kind, "action")
+        coordinator.acknowledge_action(success=False)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        self.assertNotIn("model_condition_claims_applied",
+                         [event["event"] for event in coordinator.report()["events"]])
+
+    def test_model_claim_status_is_forwarded_to_the_next_recovery_prompt(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "tap", "target": "save",
+              "condition_updates": [{"condition_id": "c1", "status": "satisfied",
+                                      "evidence": "Saved email is visible"}]},
+             {"action": "wait"}],
+            [slim_execute_reply()], condition_update_policy="model_claim")
+        first = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(first.kind, "action")
+        coordinator.acknowledge_action(success=True)
+        second = coordinator.step(frame("after_save"))
+        self.assertEqual(second.kind, "action")
+        self.assertEqual(executor.requests[-1][1].condition_status,
+                         ((condition, "satisfied"),))
+
+    def test_recovery_done_with_pending_conditions_is_rejected_for_next_prompt(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "done"}, {"action": "wait"}], [slim_execute_reply()])
+        first = coordinator.step(self.return_control(coordinator))
+        self.assertEqual((first.kind, first.scope), ("invalid_decision", "execution"))
+        self.assertFalse(coordinator.finished)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        self.assertEqual(coordinator.report()["events"][-1]["event"], "done_rejected")
+        second = coordinator.step(frame("after_rejected_done"))
+        self.assertEqual(second.kind, "action")
+        feedback = executor.requests[-1][1].last_action_feedback
+        self.assertEqual(feedback["reason"], "pending_completion_conditions")
+        self.assertEqual(feedback["pending_conditions"], [condition])
+
+    def test_recovery_done_applies_terminal_model_claims(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, _ = self.make_coordinator(
+            [{"action": "done", "condition_updates": [
+                {"condition_id": "c1", "status": "satisfied", "evidence": "Saved"}
+            ]}, {"action": "wait"}], [slim_execute_reply()],
+            condition_update_policy="model_claim")
+        first = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(first.kind, "task_complete")
+        self.assertTrue(coordinator.finished)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "satisfied"}])
+        self.assertIn("model_condition_claims_applied",
+                      [event["event"] for event in coordinator.report()["events"]])
+
+    def test_recovery_done_partially_applies_terminal_claims_before_rejecting(self):
+        first = "The saved contact visibly shows the requested email."
+        second = "The contact is shown in the saved details view."
+        reply = PlanReply(Plan(
+            "EXECUTE", "Finish and save the contact.",
+            handoff=Handoff("Save the contact.", (), (first, second))))
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "done", "condition_updates": [
+                {"condition_id": "c1", "status": "satisfied", "evidence": "Email is visible"}
+            ]}, {"action": "wait"}], [reply], condition_update_policy="model_claim")
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.kind, "invalid_decision")
+        self.assertFalse(coordinator.finished)
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": first, "status": "satisfied"},
+            {"condition": second, "status": "pending"},
+        ])
+        self.assertEqual(coordinator.report()["events"][-1]["reason"],
+                         "pending_completion_conditions")
+        next_result = coordinator.step(frame("after_partial_done"))
+        self.assertEqual(next_result.kind, "action")
+        self.assertEqual(executor.requests[-1][1].last_action_feedback["pending_conditions"],
+                         [second])
+
+    def test_model_claim_ignores_host_condition_receipt(self):
+        condition = "The saved contact visibly shows the requested email."
+        coordinator, _, _ = self.make_coordinator(
+            [{"action": "tap", "target": "save"}],
+            [slim_execute_reply()], condition_update_policy="model_claim")
+        result = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(result.kind, "action")
+        coordinator.acknowledge_action(success=True, satisfied_conditions=[condition])
+        self.assertEqual(coordinator.report()["condition_status"], [
+            {"condition": condition, "status": "pending"}])
+        self.assertIn("host_condition_receipt_ignored",
+                      [event["event"] for event in coordinator.report()["events"]])
+
+    def test_repeated_recovery_action_without_state_change_enters_fallback(self):
+        coordinator, _, executor = self.make_coordinator(
+            [{"action": "tap", "target": "same"},
+             {"action": "tap", "target": "same"},
+             {"action": "done"}], [slim_execute_reply()])
+        first = coordinator.step(self.return_control(coordinator))
+        self.assertEqual(first.kind, "action")
+        coordinator.acknowledge_action(success=True)
+        second = coordinator.step(frame("same_screen_2"))
+        self.assertEqual(second.kind, "action")
+        coordinator.acknowledge_action(success=True)
+        third = coordinator.step(frame("same_screen_3"))
+        self.assertEqual((third.kind, third.scope), ("task_complete", "fallback"))
+        self.assertEqual(coordinator.report()["fallback"]["reason"],
+                         "repeated_action_without_state_change")
+        self.assertTrue(executor.requests[-1][1].resume_original)
+
     def test_explicit_fallback_preserves_original_execution_and_never_replans(self):
         coordinator, planner, executor = self.make_coordinator(
             [{"action": "wait"}, {"action": "done"}], [fallback_reply()])
@@ -361,7 +577,10 @@ class CoordinatorTests(unittest.TestCase):
     def test_verification_completion_is_one_host_event_and_review_waits_for_next_step(self):
         coordinator, planner, executor = self.make_coordinator(
             [{"action": "wait"}, {"action": "done", "text": "Untrusted verbal claim"},
-             {"action": "done"}], [verify_reply(), execute_reply()])
+             {"action": "wait", "condition_updates": [
+                 {"condition_id": "c1", "status": "satisfied", "evidence": "Saved email is visible."}
+             ]}, {"action": "done"}], [verify_reply(), execute_reply()],
+            condition_update_policy="model_claim")
         self.run_prefix(coordinator, 1)
         returned = self.return_control(coordinator)
         result = coordinator.step(returned)
@@ -372,18 +591,22 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.phase, "reviewing")
         self.assertEqual(len(executor.requests), 2)
         self.assertEqual(len(planner.requests), 1)
-        self.assertEqual(coordinator.remaining_decisions, 18)
+        self.assertEqual(coordinator.remaining_decisions, 28)
         with self.assertRaises(LifecycleError):
             coordinator.acknowledge_action(success=True)
         result = coordinator.step(frame("review_current"))
         self.assertEqual((result.kind, result.scope, result.decision_number),
-                         ("task_complete", "execution", 3))
+                         ("action", "execution", 3))
+        coordinator.acknowledge_action(success=True)
+        result = coordinator.step(frame("execute_done"))
+        self.assertEqual((result.kind, result.scope, result.decision_number),
+                         ("task_complete", "execution", 4))
         self.assertEqual(len(planner.requests), 2)
-        self.assertEqual(len(executor.requests), 3)
+        self.assertEqual(len(executor.requests), 4)
         review = planner.requests[1]
         self.assertEqual(review.current_frame_id, "review_current")
         self.assertEqual(review.decisions_used, 2)
-        self.assertEqual(review.decisions_remaining, 18)
+        self.assertEqual(review.decisions_remaining, 28)
         self.assertNotIn("Untrusted verbal claim", review.verification_report)
         self.assertEqual(review.history[-1].scope, "verification")
         self.assertIsNone(coordinator.report()["task_success"])
@@ -495,16 +718,16 @@ class CoordinatorTests(unittest.TestCase):
                 actions = [{"action": "wait"} for _ in range(18)]
                 actions += [{"action": "done"}, {"action": terminal}]
                 coordinator, planner, executor = self.make_coordinator(
-                    actions, [verify_reply(), execute_reply()])
+                    actions, [verify_reply(), execute_reply()], budget=RecoveryBudget(total_decisions=20))
                 self.run_prefix(coordinator, 18)
                 verify = coordinator.step(self.return_control(coordinator))
                 self.assertEqual(verify.decision_number, 19)
                 self.assertEqual(verify.kind, "verification_complete")
                 result = coordinator.step(frame("twentieth"))
-                self.assertEqual(result.kind, expected)
-                self.assertEqual(result.decision_number, TOTAL_DECISIONS)
+                self.assertEqual(result.kind, expected if terminal == "fail" else "invalid_decision")
+                self.assertEqual(result.decision_number, 20)
                 self.assertEqual(coordinator.remaining_decisions, 0)
-                self.assertEqual(len(executor.requests), TOTAL_DECISIONS)
+                self.assertEqual(len(executor.requests), 20)
                 self.assertEqual([item.decision_number for item in coordinator.history],
                                  list(range(1, 21)))
                 self.assertEqual(planner.requests[0].decisions_used, 18)
@@ -528,6 +751,23 @@ class CoordinatorTests(unittest.TestCase):
                          "separate_preparation_counter_not_gui_decisions")
         self.assertTrue(semantics["verification"].startswith("verification_actions"))
 
+    def test_budget_accepts_any_positive_integer_and_rejects_invalid_types(self):
+        request = PublicEvidenceTypeTests().request()
+        self.assertEqual(RecoveryBudget().total_decisions, 30)
+        self.assertEqual(request.total_decisions, 30)
+        self.assertEqual(TOTAL_DECISIONS, 30)
+        for total in (1, 20, 30, 250, 10000):
+            with self.subTest(total=total):
+                self.assertEqual(RecoveryBudget(total_decisions=total).total_decisions, total)
+                configured = replace(request, total_decisions=total, decisions_remaining=total - 1)
+                self.assertEqual(configured.total_decisions, total)
+        for invalid in (0, -1, True, False, 20.0, "30", None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    RecoveryBudget(total_decisions=invalid)
+                with self.assertRaises(ValueError):
+                    replace(request, total_decisions=invalid)
+
     def test_executor_protocol_error_is_classified_separately_from_recovery_control(self):
         coordinator, planner, executor = self.make_coordinator(
             [RuntimeError("provider output")])
@@ -540,7 +780,8 @@ class CoordinatorTests(unittest.TestCase):
                            None, {"action": "tap", "value": float("nan")}):
             with self.subTest(bad_action=type(bad_action).__name__):
                 coordinator, planner, executor = self.make_coordinator(
-                    [{"action": "wait"} for _ in range(19)] + [bad_action])
+                    [{"action": "wait"} for _ in range(19)] + [bad_action],
+                    budget=RecoveryBudget(total_decisions=20))
                 self.run_prefix(coordinator, 19)
                 result = coordinator.step(frame("failed_decision"))
                 self.assertEqual((result.kind, result.decision_number), ("agent_error", 20))
@@ -552,7 +793,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_twentieth_device_action_requires_ack_before_budget_exhaustion(self):
         coordinator, planner, executor = self.make_coordinator(
-            [{"action": "wait"} for _ in range(20)])
+            [{"action": "wait"} for _ in range(20)], budget=RecoveryBudget(total_decisions=20))
         self.run_prefix(coordinator, 19)
         result = coordinator.step(frame("twentieth_action"))
         self.assertEqual((result.kind, result.decision_number), ("action", 20))
@@ -572,7 +813,7 @@ class CoordinatorTests(unittest.TestCase):
             with self.subTest(terminal=terminal):
                 coordinator, planner, executor = self.make_coordinator(
                     [{"action": "wait"} for _ in range(19)] + [{"action": terminal}],
-                    [verify_reply()])
+                    [verify_reply()], budget=RecoveryBudget(total_decisions=20))
                 self.run_prefix(coordinator, 18)
                 result = coordinator.step(self.return_control(coordinator))
                 self.assertEqual((result.kind, result.scope), ("action", "verification"))
@@ -588,7 +829,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_verification_cannot_start_with_only_one_decision_left(self):
         coordinator, planner, executor = self.make_coordinator(
             [{"action": "wait"} for _ in range(19)] + [{"action": "done"}],
-            [verify_reply()])
+            [verify_reply()], budget=RecoveryBudget(total_decisions=20))
         self.run_prefix(coordinator, 19)
         result = coordinator.step(self.return_control(coordinator))
         self.assertEqual((result.kind, result.scope, result.decision_number),
@@ -634,7 +875,8 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.step(frame("after_device_error"))
 
     def test_device_error_on_last_decision_keeps_device_error_classification(self):
-        coordinator, _, _ = self.make_coordinator([{"action": "wait"} for _ in range(20)])
+        coordinator, _, _ = self.make_coordinator([{"action": "wait"} for _ in range(20)],
+                                                 budget=RecoveryBudget(total_decisions=20))
         self.run_prefix(coordinator, 19)
         coordinator.step(frame("last_device_action"))
         self.assertEqual(coordinator.acknowledge_action(success=False).kind, "device_error")
@@ -642,7 +884,10 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_frame_replay_and_evidence_id_reassignment_are_rejected(self):
         coordinator, planner, executor = self.make_coordinator(
-            [{"action": "wait"}, {"action": "done"}], [execute_reply()])
+            [{"action": "wait"}, {"action": "wait", "condition_updates": [
+                {"condition_id": "c1", "status": "satisfied", "evidence": "Saved email is visible."}
+             ]}, {"action": "done"}], [execute_reply()],
+            condition_update_policy="model_claim")
         initial = frame("initial")
         coordinator.step(initial)
         coordinator.acknowledge_action(success=True)
@@ -654,7 +899,10 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.decisions_used, 1)
         self.assertEqual(planner.requests, [])
         self.assertEqual(len(executor.requests), 1)
-        self.assertEqual(coordinator.step(returned).kind, "task_complete")
+        execution = coordinator.step(returned)
+        self.assertEqual(execution.kind, "action")
+        coordinator.acknowledge_action(success=True)
+        self.assertEqual(coordinator.step(frame("after_frame_replay")).kind, "task_complete")
 
     def test_terminal_decisions_reject_further_steps_and_control_signals(self):
         coordinator, _, executor = self.make_coordinator([{"action": "done"}])
@@ -736,7 +984,7 @@ class PublicEvidenceTypeTests(unittest.TestCase):
             original_goal=GOAL, public_constraints=CONSTRAINTS,
             history=(OwnAction(1, {"action": "wait"}, "original", "pre"),),
             frames=(frame("pre"), frame("current")), current_frame_id="current",
-            decisions_used=1, decisions_remaining=19,
+            decisions_used=1, decisions_remaining=29,
             verification_rounds_remaining=1, cloud_calls_remaining_after_this=1,
             pre_handoff_frame_id="pre",
         )

@@ -10,6 +10,8 @@ from threading import RLock
 from types import ModuleType
 from typing import Callable
 
+from handoff_recovery.core.protocols import recovery_task_goal
+
 
 class BenchmarkImportError(ValueError):
     """The explicit checkout is absent, incompatible, or conflicts with imports."""
@@ -17,18 +19,27 @@ class BenchmarkImportError(ValueError):
 
 @dataclass(frozen=True)
 class GUIOwlBindings:
+    """Complete public request boundary for the pinned GUI-Owl Agent."""
     api: ModuleType
+    request_action: Callable
     parse_tool_call: Callable
     map_mobile_use_action: Callable
     validate_action: Callable
+    validate_configuration: Callable
+    native_protocol: str = "gui_owl_mobile_use_v1"
 
 
 @dataclass(frozen=True)
 class PhoneBuddyBindings:
+    """Complete public request boundary for the pinned PhoneBuddy Agent."""
     api: ModuleType
+    request_action: Callable
     parse_tool_call: Callable
     map_phonebuddy_action: Callable
+    validate_action: Callable
     history_entry: Callable
+    validate_configuration: Callable
+    native_protocol: str = "phonebuddy_tool_call_v1"
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,34 @@ class UIVoyagerBindings:
     map_mobile_use_action: Callable
     native_action_description: Callable
     validate_action: Callable
+    validate_configuration: Callable | None = None
+
+
+@dataclass(frozen=True)
+class UIVenusBindings:
+    api: ModuleType
+    parse_completion: Callable
+    map_ui_venus_action: Callable
+    validate_action: Callable
+    validate_configuration: Callable
+
+
+@dataclass(frozen=True)
+class OpenMobileBindings:
+    api: ModuleType
+    parse_completion: Callable
+    map_openmobile_action: Callable
+    validate_action: Callable
+    validate_configuration: Callable
+
+
+@dataclass(frozen=True)
+class MAIGymBindings:
+    api: ModuleType
+    parse_completion: Callable
+    map_mai_gym_action: Callable
+    validate_action: Callable
+    validate_configuration: Callable
 
 
 @dataclass(frozen=True)
@@ -61,6 +100,25 @@ class HoloBindings:
     parse_completion: Callable
     map_holo_action: Callable
     validate_action: Callable
+    validate_configuration: Callable | None = None
+
+
+def _local_request_action(api_request, image_path, goal, *, configuration,
+                          history=None, current_image=None, recovery_context=None,
+                          prompt_path=None):
+    request_goal = recovery_task_goal(goal, recovery_context)
+    kwargs = {"configuration": configuration, "history": history}
+    if (recovery_context is not None and recovery_context.get("scope") == "execution"
+            and recovery_context.get("condition_updates_enabled") is True):
+        from handoff_recovery.executor.condition_updates import FORMAT_EXTENSION
+        kwargs["response_format_extension"] = FORMAT_EXTENSION
+    if current_image is not None:
+        kwargs["current_image"] = current_image
+    if prompt_path is not None:
+        # PhoneBuddy's public API reads this from its configuration; this is
+        # accepted only for compatibility with older pinned checkouts.
+        kwargs["prompt_path"] = prompt_path
+    return api_request(image_path, request_goal, **kwargs)
 
 
 _IMPORT_LOCK = RLock()
@@ -132,7 +190,8 @@ def load_gui_owl_bindings(bench_path: str | Path) -> GUIOwlBindings:
             sys.path.remove(str(root))
         _check_loaded_modules(package_root)
     for module, names in (
-        (api, ("system_prompt", "build_messages", "encode_screenshot")),
+        (api, ("system_prompt", "build_messages", "encode_screenshot", "request_action",
+               "validate_configuration")),
         (agent, ("parse_tool_call", "map_mobile_use_action")),
         (android, ("validate_action",)),
     ):
@@ -142,8 +201,14 @@ def load_gui_owl_bindings(bench_path: str | Path) -> GUIOwlBindings:
         raise BenchmarkImportError("Benchmark GUI-Owl must retain four historical images")
     if any(not hasattr(api, name) for name in ("TEMPERATURE", "TOP_P", "TOP_K")):
         raise BenchmarkImportError("Benchmark GUI-Owl sampling parameters are unavailable")
-    return GUIOwlBindings(api, agent.parse_tool_call, agent.map_mobile_use_action,
-                          android.validate_action)
+    def request_action(image_path, goal, *, configuration, history=None,
+                       current_image=None, recovery_context=None):
+        return _local_request_action(
+            api.request_action, image_path, goal, configuration=configuration,
+            history=history, current_image=current_image,
+            recovery_context=recovery_context)
+    return GUIOwlBindings(api, request_action, agent.parse_tool_call, agent.map_mobile_use_action,
+                          android.validate_action, api.validate_configuration)
 
 
 def load_phonebuddy_bindings(bench_path: str | Path) -> PhoneBuddyBindings:
@@ -168,31 +233,40 @@ def load_phonebuddy_bindings(bench_path: str | Path) -> PhoneBuddyBindings:
         try:
             api = import_module("resumebench.models.api_method_phonebuddy")
             agent = import_module("resumebench.agents.phonebuddy")
+            android = import_module("resumebench.devices.android")
         except ImportError:
             raise BenchmarkImportError("Could not import the explicit Benchmark PhoneBuddy helpers") from None
         finally:
             sys.path.remove(str(root))
         _check_loaded_modules(package_root)
     for module, names in (
-        (api, ("build_messages", "_openai_class", "_response_text")),
+        (api, ("build_messages", "request_action", "validate_configuration",
+               "_openai_class", "_response_text")),
         (agent, ("parse_tool_call", "map_phonebuddy_action", "history_entry")),
+        (android, ("validate_action",)),
     ):
         if any(not callable(getattr(module, name, None)) for name in names):
             raise BenchmarkImportError("Benchmark PhoneBuddy public helpers are incompatible")
-    return PhoneBuddyBindings(api, agent.parse_tool_call, agent.map_phonebuddy_action,
-                              agent.history_entry)
+    def request_action(image_path, goal, *, configuration, history=None,
+                       recovery_context=None):
+        return _local_request_action(
+            api.request_action, image_path, goal, configuration=configuration,
+            history=history, recovery_context=recovery_context)
+    return PhoneBuddyBindings(api, request_action, agent.parse_tool_call, agent.map_phonebuddy_action,
+                              android.validate_action, agent.history_entry, api.validate_configuration)
 
 
 def load_cloud_bindings(bench_path: str | Path, provider: str) -> CloudBindings:
     """Load one of HandoffBench's shared visual cloud Agent bindings.
 
     The provider modules own transport and native response extraction. The
-    recovery adapter only reuses their public JSON parser and coordinate map.
+    recovery adapter only supplies scoped context/history and consumes the
+    normalized public action.
     """
     if not isinstance(bench_path, (str, Path)) or not str(bench_path).strip():
         raise BenchmarkImportError("An explicit Benchmark checkout path is required")
     if not isinstance(provider, str) or provider.strip().lower() not in {
-            "qwen", "deepseek", "openai", "claude"}:
+            "qwen", "deepseek", "openai", "claude", "qwen35", "lfm25_vl"}:
         raise BenchmarkImportError("Unsupported shared cloud provider")
     provider = provider.strip().lower()
     root = Path(bench_path).expanduser().resolve()
@@ -234,6 +308,10 @@ def load_cloud_bindings(bench_path: str | Path, provider: str) -> CloudBindings:
         mapper = getattr(common, "map_image_pixel_action", None)
         image_size = getattr(agent, "model_image_size", None)
         coordinate_space = "image_pixels"
+    elif provider in {"qwen35", "lfm25_vl"}:
+        mapper = getattr(common, "map_image_pixel_action", None)
+        image_size = getattr(agent, "native_image_size", None)
+        coordinate_space = "image_pixels"
     else:
         mapper = getattr(common, "map_image_pixel_action", None)
         image_size = getattr(common, "model_image_size", None)
@@ -245,7 +323,8 @@ def load_cloud_bindings(bench_path: str | Path, provider: str) -> CloudBindings:
     if not callable(validator):
         raise BenchmarkImportError("Benchmark cloud action validator is incompatible")
     agent_name = {"qwen": "QwenAgent", "deepseek": "DeepSeekAgent",
-                  "openai": "OpenAIAgent", "claude": "ClaudeAgent"}[provider]
+                  "openai": "OpenAIAgent", "claude": "ClaudeAgent",
+                  "qwen35": "Qwen35Agent", "lfm25_vl": "LFM25VLAgent"}[provider]
     agent_class = getattr(agent, agent_name, None)
     if not isinstance(agent_class, type):
         raise BenchmarkImportError("Benchmark cloud Agent class is incompatible")
@@ -281,14 +360,15 @@ def load_ui_voyager_bindings(bench_path: str | Path) -> UIVoyagerBindings:
             sys.path.remove(str(root))
         _check_loaded_modules(package_root)
     for module, names in (
-        (api, ("request_action",)),
+        (api, ("request_action", "validate_configuration")),
         (agent, ("parse_tool_call", "map_mobile_use_action", "native_action_description")),
         (android, ("validate_action",)),
     ):
         if any(not callable(getattr(module, name, None)) for name in names):
             raise BenchmarkImportError("Benchmark UI-Voyager helpers are incompatible")
     return UIVoyagerBindings(api, agent.parse_tool_call, agent.map_mobile_use_action,
-                             agent.native_action_description, android.validate_action)
+                             agent.native_action_description, android.validate_action,
+                             api.validate_configuration)
 
 
 def load_holo_bindings(bench_path: str | Path) -> HoloBindings:
@@ -310,14 +390,101 @@ def load_holo_bindings(bench_path: str | Path) -> HoloBindings:
             sys.path.remove(str(root))
         _check_loaded_modules(package_root)
     for module, names in (
-        (api, ("request_action", "encode_screenshot")),
+        (api, ("request_action", "encode_screenshot", "validate_configuration")),
         (agent, ("parse_completion", "map_holo_action")),
         (android, ("validate_action",)),
     ):
         if any(not callable(getattr(module, name, None)) for name in names):
             raise BenchmarkImportError("Benchmark Holo helpers are incompatible")
     return HoloBindings(api, agent.parse_completion, agent.map_holo_action,
-                        android.validate_action)
+                        android.validate_action, api.validate_configuration)
+
+
+def load_ui_venus_bindings(bench_path: str | Path) -> UIVenusBindings:
+    """Load UI-Venus's native completion parser and normalized action mapper."""
+    root, package_root = _validate_bench_root(bench_path, (
+        "__init__.py", "agents/ui_venus.py", "models/api_method_ui_venus.py",
+        "devices/android.py",
+    ), "UI-Venus")
+    with _IMPORT_LOCK:
+        _check_loaded_modules(package_root)
+        sys.path.insert(0, str(root))
+        try:
+            api = import_module("resumebench.models.api_method_ui_venus")
+            agent = import_module("resumebench.agents.ui_venus")
+            android = import_module("resumebench.devices.android")
+        except ImportError:
+            raise BenchmarkImportError("Could not import the explicit UI-Venus helpers") from None
+        finally:
+            sys.path.remove(str(root))
+        _check_loaded_modules(package_root)
+    for module, names in (
+        (api, ("request_action", "encode_screenshot", "validate_configuration")),
+        (agent, ("parse_completion", "map_ui_venus_action")),
+        (android, ("validate_action",)),
+    ):
+        if any(not callable(getattr(module, name, None)) for name in names):
+            raise BenchmarkImportError("Benchmark UI-Venus helpers are incompatible")
+    return UIVenusBindings(api, agent.parse_completion, agent.map_ui_venus_action,
+                        android.validate_action, api.validate_configuration)
+
+
+def load_openmobile_bindings(bench_path: str | Path) -> OpenMobileBindings:
+    """Load OpenMobile's native completion parser and normalized action mapper."""
+    root, package_root = _validate_bench_root(bench_path, (
+        "__init__.py", "agents/openmobile.py", "models/api_method_openmobile.py",
+        "devices/android.py",
+    ), "OpenMobile")
+    with _IMPORT_LOCK:
+        _check_loaded_modules(package_root)
+        sys.path.insert(0, str(root))
+        try:
+            api = import_module("resumebench.models.api_method_openmobile")
+            agent = import_module("resumebench.agents.openmobile")
+            android = import_module("resumebench.devices.android")
+        except ImportError:
+            raise BenchmarkImportError("Could not import the explicit OpenMobile helpers") from None
+        finally:
+            sys.path.remove(str(root))
+        _check_loaded_modules(package_root)
+    for module, names in (
+        (api, ("request_action", "encode_screenshot", "validate_configuration")),
+        (agent, ("parse_completion", "map_openmobile_action")),
+        (android, ("validate_action",)),
+    ):
+        if any(not callable(getattr(module, name, None)) for name in names):
+            raise BenchmarkImportError("Benchmark OpenMobile helpers are incompatible")
+    return OpenMobileBindings(api, agent.parse_completion, agent.map_openmobile_action,
+                        android.validate_action, api.validate_configuration)
+
+
+def load_mai_gym_bindings(bench_path: str | Path) -> MAIGymBindings:
+    """Load MAIGym's native completion parser and normalized action mapper."""
+    root, package_root = _validate_bench_root(bench_path, (
+        "__init__.py", "agents/mai_gym.py", "models/api_method_mai_gym.py",
+        "devices/android.py",
+    ), "MAIGym")
+    with _IMPORT_LOCK:
+        _check_loaded_modules(package_root)
+        sys.path.insert(0, str(root))
+        try:
+            api = import_module("resumebench.models.api_method_mai_gym")
+            agent = import_module("resumebench.agents.mai_gym")
+            android = import_module("resumebench.devices.android")
+        except ImportError:
+            raise BenchmarkImportError("Could not import the explicit MAIGym helpers") from None
+        finally:
+            sys.path.remove(str(root))
+        _check_loaded_modules(package_root)
+    for module, names in (
+        (api, ("request_action", "encode_screenshot", "validate_configuration")),
+        (agent, ("parse_completion", "map_mai_gym_action")),
+        (android, ("validate_action",)),
+    ):
+        if any(not callable(getattr(module, name, None)) for name in names):
+            raise BenchmarkImportError("Benchmark MAIGym helpers are incompatible")
+    return MAIGymBindings(api, agent.parse_completion, agent.map_mai_gym_action,
+                        android.validate_action, api.validate_configuration)
 
 
 def _validate_bench_root(bench_path: str | Path, required: tuple[str, ...], label: str):

@@ -17,7 +17,7 @@ import unittest
 from unittest.mock import Mock
 import zlib
 
-from handoff_recovery.core.types import Handoff, Plan, PlanReply, Unknown, VerificationTask
+from handoff_recovery.core.types import Handoff, Plan, PlanReply, SlimPlan, Unknown, VerificationTask
 from handoff_recovery.executor import GUIOwlConfiguration, GUIOwlExecutor
 from handoff_recovery.integrations.handoffbench import HandoffRecoveryAgent
 
@@ -38,11 +38,26 @@ def execute_plan():
                         ("Keep unrelated user data.",), ("The original requested final setting is visible.",))))
 
 
+def claimed_done():
+    return {"action": "done", "condition_updates": [
+        {"condition_id": "c1", "status": "satisfied",
+         "evidence": "The original requested final setting is visible."},
+    ]}
+
+
 def verify_plan():
     return PlanReply(Plan("VERIFY", "The saved value is not visible.",
         unknowns=(Unknown("What is the saved value?", True, "The current page does not show it."),),
         verification=VerificationTask("Read the saved setting on its details page.",
                                       ("The visible saved value.",), ("Do not edit data.",))))
+
+
+def complete_plan():
+    return PlanReply(SlimPlan(
+        "VERIFY", "Confirm that the original final state is visible.",
+        ("The original requested final setting is visible.",),
+        completion_status="COMPLETE",
+    ))
 
 
 class Planner:
@@ -134,10 +149,13 @@ class RunnerBridgeTests(unittest.TestCase):
                                 "end": {"check": "handoff", "terminal": True, "timeout_seconds": 0.02}}}
 
     def run_case(self, actions, replies=(), *, mode="takeover", prefix_decisions=0,
-                 goal_status="true", executor=None, fail_action=False, **options):
+                 goal_status="true", executor=None, fail_action=False,
+                 completion_policy=None, **options):
         planner = Planner(replies)
         executor = executor or Executor(actions)
-        bridge = HandoffRecoveryAgent(bench_path=self.root, planner=planner, executor=executor)
+        bridge_options = {} if completion_policy is None else {"completion_policy": completion_policy}
+        bridge = HandoffRecoveryAgent(bench_path=self.root, planner=planner, executor=executor,
+                                      **bridge_options)
         from resumebench.core.runner import run_task
         device = Device(fail_action=fail_action)
         checker = Checker(prefix_decisions=prefix_decisions, goal_status=goal_status)
@@ -160,7 +178,7 @@ class RunnerBridgeTests(unittest.TestCase):
 
     def test_initial_takeover_without_prefix_has_no_invented_pre_image(self):
         result, bridge, planner, executor, _, _ = self.run_case(
-            [{"action": "done"}], [execute_plan()])
+            [claimed_done()], [execute_plan()])
         self.assertEqual(result["takeover_status"], "VALID")
         self.assertEqual(result["counts"]["decisions"], {"task": 0, "prefix": 0, "resume": 1})
         self.assertIsNone(planner.calls[0].pre_handoff_frame_id)
@@ -172,7 +190,7 @@ class RunnerBridgeTests(unittest.TestCase):
 
     def test_verification_completion_is_counted_but_not_sent_to_device_or_terminal(self):
         result, bridge, planner, executor, device, checker = self.run_case(
-            [{"action": "wait"}, {"action": "done"}, {"action": "done"}],
+            [{"action": "wait"}, {"action": "done"}, claimed_done()],
             [verify_plan(), execute_plan()])
         self.assertEqual(result["termination_reason"], "agent_done")
         self.assertIs(result["task_success"], True)
@@ -185,20 +203,98 @@ class RunnerBridgeTests(unittest.TestCase):
         self.assertEqual(planner.calls[1].decisions_used, 2)
         self.assertEqual(bridge.report()["cloud_calls_after_handoff"], 0)
 
+    def test_default_conditions_rejects_done_until_claimed_and_keeps_budget(self):
+        result, bridge, planner, executor, device, checker = self.run_case(
+            [{"action": "done"}, claimed_done()], [execute_plan()], goal_status="false")
+        self.assertEqual(bridge.coordinator.completion_policy, "conditions")
+        self.assertEqual(result["termination_reason"], "agent_done")
+        self.assertIs(result["task_success"], False)
+        self.assertIsNone(bridge.report()["task_success"])
+        self.assertEqual(result["counts"]["decisions"], {"task": 0, "prefix": 0, "resume": 2})
+        self.assertEqual(bridge.report()["budget"]["used"], 2)
+        self.assertEqual(len(executor.calls), 2)
+        self.assertEqual(len(planner.calls), 1)
+        self.assertFalse(device.public_actions)
+        self.assertEqual(checker.calls.count("goal"), 1)
+        self.assertEqual([item["status"] for item in bridge.report()["condition_status"]], ["satisfied"])
+        rejections = [event for event in bridge.report()["events"] if event["event"] == "done_rejected"]
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(rejections[0]["reason"], "pending_completion_conditions")
+        self.assertEqual(executor.calls[1][1].condition_status,
+                         (("The original requested final setting is visible.", "pending"),))
+
+    def test_complete_verify_is_terminal_and_is_scored_once(self):
+        result, bridge, planner, executor, device, checker = self.run_case(
+            [{"action": "done"}], [complete_plan()])
+        self.assertEqual(result["termination_reason"], "agent_done")
+        self.assertTrue(result["agent_done"])
+        self.assertIs(result["task_success"], True)
+        self.assertEqual(result["counts"]["decisions"]["resume"], 1)
+        self.assertEqual(len(planner.calls), 1)
+        self.assertEqual(len(executor.calls), 1)
+        self.assertEqual(result["public_agent_protocol"]["subtask_completions"], 0)
+        self.assertEqual(checker.calls.count("goal"), 1)
+        self.assertFalse(device.public_actions)
+        self.assertEqual(bridge.coordinator.terminal_reason, "task_complete")
+
     def test_prefix_and_resume_preserve_goal_history_and_budget(self):
         result, bridge, planner, executor, _, _ = self.run_case(
-            [{"action": "wait"}, {"action": "done"}], [execute_plan()], prefix_decisions=1)
+            [{"action": "wait"}, claimed_done()], [execute_plan()], prefix_decisions=1)
         self.assertEqual(result["counts"]["decisions"], {"task": 0, "prefix": 1, "resume": 1})
         request = planner.calls[0]
-        self.assertEqual((request.decisions_used, request.decisions_remaining), (1, 19))
+        self.assertEqual((request.decisions_used, request.decisions_remaining), (1, 29))
         self.assertEqual(request.pre_handoff_frame_id, executor.calls[0][0].evidence_id)
         self.assertEqual(request.history[0].action["action"], "wait")
         self.assertEqual(len(executor.starts), 1)
         self.assertEqual(bridge.report()["budget"]["used"], 2)
 
+    def add_user_actions(self, count):
+        """Run several public control operations while the Agent is paused."""
+        self.flow["max_transitions"] = count + 1
+        for index in range(count):
+            self.flow["states"][f"user_{index}"] = {
+                "check": "entry" if index == 0 else "handoff",
+                "action": {"op": "click", "target": "button"},
+                "next": f"user_{index + 1}" if index + 1 < count else "end"}
+        self.flow["initial_state"] = "user_0"
+
+    def test_small_configured_budget_excludes_more_user_actions_than_agent_decisions(self):
+        self.add_user_actions(6)
+        result, bridge, planner, executor, device, _ = self.run_case(
+            [{"action": "wait"}, {"action": "wait"}, {"action": "done"}],
+            [execute_plan()], prefix_decisions=1, max_decisions=3, completion_policy="native")
+        self.assertTrue(result["task_success"])
+        self.assertTrue(result["recovery_success"])
+        self.assertEqual(result["counts"]["decisions"], {"task": 0, "prefix": 1, "resume": 2})
+        self.assertEqual(result["counts"]["takeover_actions"], 6)
+        self.assertEqual(len(device.user_actions), 6)
+        self.assertEqual(len(executor.calls), 3)
+        self.assertEqual(bridge.report()["budget"]["used"], 3)
+        request = planner.calls[0]
+        self.assertEqual((request.total_decisions, request.decisions_used, request.decisions_remaining),
+                         (3, 1, 2))
+
+    def test_large_budget_is_shared_by_prefix_verification_and_recovery(self):
+        self.add_user_actions(6)
+        actions = [{"action": "wait"}] * 7 + [{"action": "done"}]
+        actions += [{"action": "wait"}] * 241 + [claimed_done()]
+        result, bridge, planner, executor, device, _ = self.run_case(
+            actions, [verify_plan(), execute_plan()], prefix_decisions=7, max_decisions=250)
+        self.assertEqual(result["termination_reason"], "agent_done")
+        self.assertTrue(result["task_success"])
+        self.assertTrue(result["recovery_success"])
+        self.assertEqual(result["budgets"], {"task": 250, "prefix": None, "resume": None})
+        self.assertEqual(result["counts"]["decisions"], {"task": 0, "prefix": 7, "resume": 243})
+        self.assertEqual(result["counts"]["takeover_actions"], 6)
+        self.assertEqual(len(device.user_actions), 6)
+        self.assertEqual(len(executor.calls), 250)
+        self.assertEqual(bridge.report()["budget"]["used"], 250)
+        self.assertEqual([(r.total_decisions, r.decisions_used, r.decisions_remaining)
+                          for r in planner.calls], [(250, 7, 243), (250, 8, 242)])
+
     def test_deferred_prefix_done_can_enter_takeover_without_reset(self):
         result, bridge, planner, executor, _, _ = self.run_case(
-            [{"action": "done"}, {"action": "done"}], [execute_plan()], prefix_decisions=1)
+            [{"action": "done"}, claimed_done()], [execute_plan()], prefix_decisions=1)
         self.assertEqual(result["takeover_status"], "VALID")
         self.assertEqual(len(executor.calls), 2)
         self.assertEqual(planner.calls[0].history[0].action["action"], "done")
@@ -209,7 +305,7 @@ class RunnerBridgeTests(unittest.TestCase):
     def test_last_step_verification_done_never_scores_original_success(self):
         result, bridge, planner, executor, device, _ = self.run_case(
             [{"action": "wait"}] * 19 + [{"action": "done"}],
-            [verify_plan()], prefix_decisions=18)
+            [verify_plan()], prefix_decisions=18, max_decisions=20)
         self.assertEqual(result["termination_reason"], "budget_exhausted")
         self.assertIs(result["task_success"], False)
         self.assertIs(result["recovery_success"], False)
@@ -248,7 +344,9 @@ class RunnerBridgeTests(unittest.TestCase):
             raw = 'Action: Inspect visible state\n<tool_call>\n' + json.dumps(
                 {"name": "mobile_use", "arguments": arguments}) + '\n</tool_call>'
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw, tool_calls=None))])
-        create = Mock(side_effect=[response({"action": "answer", "text": "Visible evidence read"}),
+        create = Mock(side_effect=[response({"action": "click", "coordinate": [500, 500]}),
+                                  response({"action": "answer", "text": "Visible evidence read"}),
+                                  response({"action": "wait", "time": 1}),
                                   response({"action": "terminate", "status": "success"})])
         client = Mock()
         client.chat.completions.create = create
@@ -257,21 +355,35 @@ class RunnerBridgeTests(unittest.TestCase):
         factory.return_value.__exit__ = Mock(return_value=False)
         executor = GUIOwlExecutor(self.root, GUIOwlConfiguration(), client_factory=factory)
         result, bridge, planner, _, device, _ = self.run_case(
-            [], [verify_plan(), execute_plan()], executor=executor)
+            [], [verify_plan(), execute_plan()], executor=executor, completion_policy="native")
         self.assertEqual(result["termination_reason"], "agent_done")
-        self.assertEqual(result["counts"]["decisions"]["resume"], 2)
-        self.assertEqual(create.call_count, 2)
-        self.assertEqual(len(executor._context), 1)
+        self.assertEqual(result["counts"]["decisions"]["resume"], 4)
+        self.assertEqual(create.call_count, 4)
+        self.assertEqual(len(executor._context), 2)
         self.assertEqual(len(planner.calls), 2)
-        self.assertFalse(device.public_actions)
-        first, second = [call.kwargs["messages"] for call in create.call_args_list]
-        self.assertIn('"scope": "verification"', first[-1]["content"][-1]["text"])
-        self.assertIn('"scope": "execution"', second[-1]["content"][-1]["text"])
-        self.assertIn("Visible evidence read", str(second))
+        self.assertEqual([action["action"] for action in device.public_actions], ["tap", "wait"])
+        requests = [call.kwargs["messages"] for call in create.call_args_list]
+        for index, messages in enumerate(requests):
+            text = "\n".join(block["text"] for message in messages for block in message["content"]
+                             if block["type"] == "text")
+            self.assertIn(bridge.coordinator.original_goal, text)
+            self.assertIn("Read the saved setting on its details page." if index < 2
+                          else "Complete the unchanged original task from the current page.", text)
+            assistants = [message for message in messages if message["role"] == "assistant"]
+            self.assertEqual(len(assistants), index % 2)
+            if assistants:
+                self.assertIn('"action": "click"' if index < 2 else '"action": "wait"',
+                              assistants[0]["content"][0]["text"])
+            self.assertNotIn("Visible evidence read", text)
+            self.assertNotIn("Last action feedback", text)
+            self.assertNotIn('"scope":', text)
+        self.assertEqual(bridge.coordinator.completion_policy, "native")
+        self.assertIsNone(bridge.report()["error_category"])
+        self.assertEqual([item["status"] for item in bridge.report()["condition_status"]], ["pending"])
         self.assertEqual(bridge.report()["cloud_calls_after_handoff"], 0)
 
     def test_callbacks_are_notification_only_and_mismatched_budget_is_rejected(self):
-        planner, executor = Planner([execute_plan()]), Executor([{"action": "done"}])
+        planner, executor = Planner([execute_plan()]), Executor([claimed_done()])
         bridge = HandoffRecoveryAgent(bench_path=self.root, planner=planner, executor=executor)
         from resumebench.core.agent_protocol import ControlEvent, DecisionContext, TaskStart
         bridge.on_task_start(TaskStart(1, "Public goal", 19))

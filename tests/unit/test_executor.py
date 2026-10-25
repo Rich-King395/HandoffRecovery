@@ -16,8 +16,10 @@ import unittest
 from unittest.mock import Mock, patch
 import zlib
 
-from handoff_recovery.core.types import ConditionalAction, Handoff, LocalInstruction, PublicFrame, VerificationTask
-from handoff_recovery.core.protocols import HISTORY_POLICY_VERSION, apply_history_policy
+from handoff_recovery.core.types import Handoff, LocalInstruction, PublicFrame, VerificationTask
+from handoff_recovery.core.protocols import (HISTORY_POLICY_VERSION, apply_history_policy,
+                                              history_policy_descriptor,
+                                              history_policy_transition)
 from handoff_recovery.executor import ExecutorError, GUIOwlConfiguration, GUIOwlExecutor
 from handoff_recovery.integrations.handoffbench import BenchmarkImportError, load_gui_owl_bindings
 from handoff_recovery.integrations.handoffbench.loader import _check_loaded_modules
@@ -97,8 +99,19 @@ class ExecutorTests(unittest.TestCase):
                                        client_factory=self.factory)
         self.executor.start_task("task-1", GOAL)
 
+    def test_gui_owl_descriptor_keeps_native_protocol_explicit(self):
+        descriptor = self.executor.descriptor
+        self.assertEqual(descriptor["native_protocol"], "gui_owl_mobile_use_v1")
+        self.assertEqual(descriptor["action_normalization"],
+                         "native_parser_then_handoffbench_mapper")
+
     def test_history_policy_is_explicit_and_scope_transitions_are_shared(self):
-        self.assertEqual(HISTORY_POLICY_VERSION, "recovery_history_v1")
+        self.assertEqual(HISTORY_POLICY_VERSION, "recovery_history_v3")
+        descriptor = history_policy_descriptor()
+        self.assertEqual(descriptor["same_scope"], "retain_only_current_scope_native_history")
+        self.assertEqual(descriptor["recovery_history_mode"], "isolated")
+        self.assertFalse(history_policy_transition("execution", instruction("execution"))[
+            "recovery_context_in_native_history"])
         contexts = {"original": [{"action": "tap"}]}
         history, scope = apply_history_policy(
             contexts, contexts["original"], "original",
@@ -111,6 +124,23 @@ class ExecutorTests(unittest.TestCase):
             LocalInstruction(GOAL, (), "fallback", resume_original=True,
                              resume_reason="planner_failed"))
         self.assertEqual((history, scope), ([{"action": "tap"}], "original"))
+
+    def test_history_policy_can_explicitly_seed_recovery_from_original_snapshot(self):
+        contexts = {"original": [{"action": "tap"}]}
+        history, scope = apply_history_policy(
+            contexts, contexts["original"], "original",
+            LocalInstruction(GOAL, (), "execution",
+                             handoff=Handoff("Finish the remaining task", (), ("Done",))),
+            recovery_history_mode="original_snapshot")
+        self.assertEqual((history, scope), ([{"action": "tap"}], "execution"))
+
+    def test_history_policy_rejects_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            history_policy_descriptor("unexpected")
+
+    def test_history_policy_rejects_unknown_previous_scope(self):
+        with self.assertRaises(ValueError):
+            apply_history_policy({}, [], "unknown", instruction("original"))
 
     def test_one_request_uses_native_sampling_and_no_action_normalization_defaults(self):
         action = self.executor.decide(frame(), instruction())
@@ -126,6 +156,51 @@ class ExecutorTests(unittest.TestCase):
         self.context_manager.__exit__.assert_called_once()
         self.assertFalse(any(path.exists() for path in self.paths))
 
+    def test_production_path_delegates_request_to_handoffbench_api(self):
+        self.bindings.request_action = Mock(return_value="native output")
+        executor = GUIOwlExecutor("/explicit/benchmark",
+                                   GUIOwlConfiguration(api_key="private-test-key"))
+        executor.start_task("task-api", GOAL)
+        with patch("handoff_recovery.executor.gui_owl.load_gui_owl_bindings",
+                   return_value=self.bindings):
+            action = executor.decide(frame(), instruction("original"))
+        self.assertEqual(action, {"action": "tap", "coords": [1, 1], "target": "Read the clock"})
+        self.bindings.request_action.assert_called_once()
+        request = self.bindings.request_action.call_args
+        self.assertEqual(request.args[1], GOAL)
+        self.assertEqual(request.kwargs["history"], [])
+        self.assertIsNone(request.kwargs["recovery_context"])
+        self.assertIsNotNone(request.kwargs["current_image"])
+        self.assertIsNotNone(request.kwargs["configuration"])
+
+    def test_production_request_keeps_public_image_path_alive(self):
+        seen = {}
+
+        def request_action(image_path, _goal, **_kwargs):
+            seen["exists_during_request"] = Path(image_path).exists()
+            return "native output"
+
+        self.bindings.request_action = Mock(side_effect=request_action)
+        executor = GUIOwlExecutor("/explicit/benchmark",
+                                   GUIOwlConfiguration(api_key="private-test-key"))
+        executor.start_task("task-api-image", GOAL)
+        with patch("handoff_recovery.executor.gui_owl.load_gui_owl_bindings",
+                   return_value=self.bindings):
+            executor.decide(frame(), instruction("original"))
+        self.assertTrue(seen["exists_during_request"])
+
+    def test_production_path_passes_structured_recovery_context(self):
+        self.bindings.request_action = Mock(return_value="native output")
+        executor = GUIOwlExecutor("/explicit/benchmark",
+                                   GUIOwlConfiguration(api_key="private-test-key"))
+        executor.start_task("task-api-context", GOAL)
+        with patch("handoff_recovery.executor.gui_owl.load_gui_owl_bindings",
+                   return_value=self.bindings):
+            executor.decide(frame(), instruction("execution"))
+        context = self.bindings.request_action.call_args.kwargs["recovery_context"]
+        self.assertEqual(context["scope"], "execution")
+        self.assertIn("handoff", context)
+
     def test_only_latest_message_receives_context_with_scope_isolation(self):
         scopes = ("original", "verification", "execution", "fallback", "execution", "execution", "execution")
         for index, scope in enumerate(scopes):
@@ -136,18 +211,33 @@ class ExecutorTests(unittest.TestCase):
             if scope == "original":
                 self.assertEqual(request, baseline)
             else:
-                self.assertEqual(request[:-1], baseline[:-1])
-                self.assertEqual(request[-1]["content"][:-1], baseline[-1]["content"])
-                self.assertIn(f'"scope": "{scope}"', request[-1]["content"][-1]["text"])
-            expected = 0
-            for prior in reversed(scopes[:index]):
-                if prior != scopes[index]:
-                    break
-                expected += 1
+                self.assertEqual(request, baseline)
+                serialized = json.dumps(request, ensure_ascii=False)
+                self.assertNotIn("Recovery context", serialized)
+                self.assertNotIn("inspect_before_action", serialized)
+                self.assertNotIn("conditional_actions", serialized)
+            if scope == "original":
+                expected = 0
+            else:
+                # Recovery entry is isolated by default; subsequent calls in
+                # the same recovery scope append locally.
+                if scope == "fallback":
+                    expected = 1  # original scope's one native action
+                else:
+                    expected = 0
+                    for prior in reversed(scopes[:index]):
+                        if prior != scopes[index]:
+                            break
+                        expected += 1
             self.assertEqual(len(self.histories[-1]), expected)
-        self.assertEqual(self.goals, [GOAL] * len(scopes))
+        self.assertEqual(self.goals[0], GOAL)
+        self.assertIn("Original task (final goal and required values):", self.goals[1])
+        self.assertIn("Read existing alarm time", self.goals[1])
+        self.assertIn("bounded read-only check", self.goals[1])
+        self.assertIn("Set only the incorrect time", self.goals[2])
+        self.assertIn("A user takeover occurred while the original task was being executed", self.goals[2])
         self.assertEqual([record["output"] for record in self.executor._context],
-                         [f"native output {i}" for i in range(4, 7)])
+                         ["native output 4", "native output 5", "native output 6"])
         self.assertEqual(sum(record["image"] is not None for record in self.executor._context), 3)
         self.assertEqual(self.histories[1], [])
 
@@ -155,26 +245,18 @@ class ExecutorTests(unittest.TestCase):
         self.bindings.map_mobile_use_action.side_effect = lambda *_: {"action": "done", "coords": [], "reason": "Time is 09:00"}
         action = self.executor.decide(frame(), instruction("verification"))
         self.assertEqual(action["action"], "done")
-        prompt = self.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("declares verification complete only", prompt)
-        self.assertIn("Do not edit alarm data", prompt)
+        prompt = self.create.call_args.kwargs["messages"][1]["content"][0]["text"]
+        self.assertIn("Read existing alarm time", prompt)
+        self.assertIn("Completion condition status:", prompt)
+        self.assertNotIn("Completion conditions / evidence to obtain:", prompt)
         self.assertEqual(self.create.call_count, 1)
         self.assertEqual(len(self.executor._context), 1)
 
     def test_execution_prompt_requires_completion_condition_self_check(self):
         self.executor.decide(frame(), instruction("execution"))
-        prompt = self.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("check every completion_condition", prompt)
-        self.assertIn("pre-handoff history is not evidence", prompt)
-
-    def test_execution_prompt_includes_local_inspection_branches(self):
-        handoff = Handoff("Restore the requested setting.", (), ("The setting is correct.",),
-                          ("Open Appearance and read the explicit value.",),
-                          (ConditionalAction("The value is Light.", "Select Dark."),))
-        self.executor.decide(frame(), LocalInstruction(GOAL, (), "execution", handoff=handoff))
-        prompt = self.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("inspect_before_action", prompt)
-        self.assertIn("Select Dark.", prompt)
+        prompt = self.create.call_args.kwargs["messages"][1]["content"][0]["text"]
+        self.assertIn("condition_updates to mark a condition [satisfied]", prompt)
+        self.assertIn("Set only the incorrect time", prompt)
 
     def test_start_task_is_only_reset_even_for_identical_goal(self):
         self.executor.decide(frame(), instruction())
@@ -199,12 +281,26 @@ class ExecutorTests(unittest.TestCase):
         self.assertNotIn("private-test-key", str(caught.exception))
         self.assertEqual(self.create.call_count, 2)
         self.assertEqual(self.executor._context, [])
+        self.assertEqual(self.executor._contexts["original"], prior)
 
     def test_invalid_mapping_is_not_recorded_or_retried(self):
         self.bindings.map_mobile_use_action.side_effect = ValueError("out of range")
         with self.assertRaises(ExecutorError):
             self.executor.decide(frame(), instruction())
         self.create.assert_called_once()
+        self.assertEqual(self.executor._context, [])
+
+    def test_native_mapper_rejection_never_guesses_pixel_coordinates(self):
+        call = {"name": "mobile_use", "arguments": {
+            "action": "click", "coordinate": [540, 1200]}}
+        self.bindings.parse_tool_call.return_value = (call, "click")
+        self.bindings.map_mobile_use_action.side_effect = ValueError("out of native range")
+        with self.assertRaises(ExecutorError) as caught:
+            self.executor.decide(frame(), instruction())
+        self.assertEqual(caught.exception.category, "action_mapping_error")
+        self.bindings.map_mobile_use_action.assert_called_once_with(call, (2, 2))
+        self.create.assert_called_once()
+        self.assertEqual(call["arguments"]["coordinate"], [540, 1200])
         self.assertEqual(self.executor._context, [])
 
     def test_request_failure_is_sanitized_and_not_retried(self):
@@ -214,6 +310,13 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "GUI-Owl request failed (RuntimeError)")
         self.create.assert_called_once()
         self.assertEqual(self.executor._context, [])
+
+    def test_integration_failure_has_explicit_category(self):
+        with patch("handoff_recovery.executor.gui_owl.load_gui_owl_bindings",
+                   side_effect=ImportError("missing benchmark helper")):
+            with self.assertRaises(ExecutorError) as caught:
+                self.executor.decide(frame(), instruction())
+        self.assertEqual(caught.exception.category, "integration_error")
 
     def test_non_native_responses_fail_with_one_request_each(self):
         for content, tool_calls in ((None, None), ([], None), ("", None), ("text", ["api tool call"])):

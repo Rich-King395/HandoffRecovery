@@ -10,23 +10,30 @@ from copy import deepcopy
 from dataclasses import dataclass, fields
 import json
 import math
+import os
 from pathlib import Path
 import re
+import shutil
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 from handoff_recovery.core.types import LocalInstruction, PublicFrame
-from handoff_recovery.core.protocols import apply_history_policy, history_policy_descriptor
+from handoff_recovery.core.protocols import (RecoveryContext, apply_history_policy,
+                                              DEFAULT_RECOVERY_HISTORY_MODE,
+                                              RECOVERY_HISTORY_MODES,
+                                              history_policy_descriptor, recovery_task_goal)
 from handoff_recovery.integrations.handoffbench import load_cloud_bindings
 
 
 class CloudExecutorError(RuntimeError):
     """One cloud GUI decision failed without an internal action retry."""
 
-    def __init__(self, message: str, *, category: str, cause_type: str | None = None):
+    def __init__(self, message: str, *, category: str, cause_type: str | None = None,
+                 recoverable: bool = False):
         super().__init__(message)
         self.category = category
         self.cause_type = cause_type
+        self.recoverable = recoverable
 
 
 @dataclass(frozen=True)
@@ -41,9 +48,14 @@ class CloudExecutorConfiguration:
     total_timeout_seconds: float | None = 120.0
     proxy_mode: str = "environment"
     max_output_tokens: int = 2048
+    # Completion checks are opt-in; keep the baseline recovery path unchanged.
+    enable_completion_check: bool = False
+    recovery_history_mode: str = DEFAULT_RECOVERY_HISTORY_MODE
+    include_recovery_constraints: bool = False
+    include_recovery_uncertain: bool = False
 
     def __post_init__(self) -> None:
-        if self.provider.strip().lower() not in {"qwen", "deepseek", "openai", "claude"}:
+        if self.provider.strip().lower() not in {"qwen", "deepseek", "openai", "claude", "qwen35", "lfm25_vl"}:
             raise ValueError("Unsupported cloud Executor provider")
         if not isinstance(self.api_key, str) or not self.api_key.strip():
             raise ValueError("Cloud Executor api_key must be nonempty")
@@ -60,9 +72,19 @@ class CloudExecutorConfiguration:
                 raise ValueError(f"Cloud Executor {name} must be finite and positive")
         if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
             raise ValueError("Cloud Executor max_output_tokens must be positive")
+        if type(self.enable_completion_check) is not bool:
+            raise TypeError("Cloud Executor enable_completion_check must be boolean")
+        if self.recovery_history_mode not in RECOVERY_HISTORY_MODES:
+            raise ValueError("Cloud Executor recovery_history_mode must be isolated or original_snapshot")
+        if type(self.include_recovery_constraints) is not bool:
+            raise TypeError("Cloud Executor include_recovery_constraints must be boolean")
+        if type(self.include_recovery_uncertain) is not bool:
+            raise TypeError("Cloud Executor include_recovery_uncertain must be boolean")
 
 
-def _current_context(instruction: LocalInstruction) -> str | None:
+def _current_context(instruction: LocalInstruction, *, include_constraints: bool = False,
+                     include_uncertain: bool = False,
+                     include_completion_check: bool = False) -> RecoveryContext | None:
     scope = instruction.scope
     if scope not in {"original", "verification", "execution", "fallback"}:
         raise ValueError("Unknown local instruction scope")
@@ -76,60 +98,35 @@ def _current_context(instruction: LocalInstruction) -> str | None:
         raise ValueError("Original and fallback scopes cannot contain recovery tasks")
     # Public constraints remain Planner/Coordinator metadata during the
     # original phase. Inject them only as recovery context after takeover.
-    if scope == "original":
+    if scope in {"original", "fallback"}:
         return None
-    payload = {"scope": scope, "public_constraints": list(instruction.public_constraints)}
-    if instruction.resume_original:
-        payload["resume_original_context"] = True
-        payload["resume_reason"] = instruction.resume_reason
+    payload = {"scope": scope,
+               "condition_status": [
+                   {"condition": condition, "status": status}
+                   for condition, status in instruction.condition_status
+               ],
+               "last_action_feedback": (deepcopy(instruction.last_action_feedback)
+                                         if instruction.last_action_feedback is not None else None)}
+    if scope == "execution" and include_completion_check:
+        payload["completion_check_required"] = True
     if scope == "verification":
         task = instruction.verification
         payload["verification"] = {
             "objective": task.objective,
             "required_evidence": list(task.required_evidence),
-            "constraints": list(task.constraints),
+            "final_confirmation": task.final_confirmation,
         }
-        guidance = (
-            "Perform only the bounded verification task below. Native done or fail "
-            "reports verification completion, not completion of the original task."
-        )
     elif scope == "execution":
         handoff = instruction.handoff
         payload["handoff"] = {
             "remaining_objective": handoff.remaining_objective,
-            "preserve": list(handoff.preserve),
             "completion_conditions": list(handoff.completion_conditions),
-            "inspect_before_action": list(handoff.inspect_before_action),
-            "conditional_actions": [{"when": item.when, "then": item.then}
-                                    for item in handoff.conditional_actions],
         }
-        guidance = (
-            "Continue the original task using the remaining objective. The latest screenshot "
-            "is authoritative; prior history is orientation only. Perform every listed "
-            "inspect_before_action check before changing task data and resolve conditional "
-            "actions locally. Before returning done, inspect the latest screen, check every "
-            "completion_condition yourself, and preserve every listed constraint."
-        )
-    elif scope == "fallback":
-        guidance = (
-            "Resume the unchanged original task. The Planner did not provide reliable "
-            "recovery guidance. The latest screenshot is authoritative; earlier history "
-            "may be stale after takeover. Reassess the visible state and check the original "
-            "task conditions yourself before returning done."
-        )
-    else:
-        guidance = "Continue the unchanged original task with these public constraints."
-    if instruction.prior_progress:
-        # Keep unverified history after the actionable recovery contract. The
-        # current screenshot is supplied separately by the shared adapter and
-        # remains authoritative for present state.
-        payload["prior_progress"] = instruction.prior_progress
-        guidance = (
-            "The latest screenshot is the authoritative current-state evidence. "
-            "The prior_progress entries below are only unverified action attempts; "
-            "they must not be treated as completed work or current UI facts.\n" + guidance
-        )
-    return guidance + "\n" + json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    if instruction.completion_policy == "native":
+        payload["completion_policy"] = "native"
+    if instruction.condition_updates_enabled is not None:
+        payload["condition_updates_enabled"] = instruction.condition_updates_enabled
+    return payload
 
 
 def _parse_qwen_computer_use(raw_text: str) -> dict:
@@ -220,6 +217,8 @@ class CloudExecutor:
         self._context_scope: str | None = None
         self._contexts: dict[str, list[dict]] = {}
         self._shared_agent = None
+        self._audit_counter = 0
+        self.requires_completion_check = configuration.enable_completion_check
 
     @property
     def provider(self) -> str:
@@ -240,8 +239,11 @@ class CloudExecutor:
                 "output_normalization": getattr(agent, "output_normalization", "none"),
                 "recovery_scopes": ["original", "verification", "execution", "fallback"],
                 "recovery_context": "optional_for_execution_verification_fallback_only",
-                "history_policy": history_policy_descriptor(),
-                "requires_completion_check": False,
+                "history_policy": history_policy_descriptor(self._configuration.recovery_history_mode),
+                "history_owner": "handoff_recovery_host_policy",
+                "recovery_constraints_in_prompt": self._configuration.include_recovery_constraints,
+                "recovery_uncertain_in_prompt": self._configuration.include_recovery_uncertain,
+                "requires_completion_check": self.requires_completion_check,
                 "configuration_source": "handoffbench_provider_validate_configuration",
                 "transport": "handoffbench_shared_cloud_agent",
                 "legacy_path_enabled": False,
@@ -260,9 +262,10 @@ class CloudExecutor:
             "protocol": "legacy_recovery_only",
             "coordinate_space": bindings.coordinate_space,
             "recovery_scopes": ["original", "verification", "execution", "fallback"],
-            "recovery_context": "legacy_string_append",
-            "requires_completion_check": False,
-            "history_policy": history_policy_descriptor(),
+            "recovery_context": "shared_structured_mapping_v1",
+            "requires_completion_check": self.requires_completion_check,
+            "history_policy": history_policy_descriptor(self._configuration.recovery_history_mode),
+            "history_owner": "handoff_recovery_host_policy",
             "transport": "legacy_recovery_cloud_executor",
             "configuration_source": "executor_spec_legacy",
             "legacy_path_enabled": True,
@@ -288,6 +291,27 @@ class CloudExecutor:
         self._context_scope = None
         self._contexts = {"original": []}
         self._shared_agent = None
+        self._audit_counter = 0
+
+    def _persist_prompt_audit(self, temporary_directory: Path, scope: str) -> None:
+        """Persist provider prompt audits when explicitly requested by a smoke run.
+
+        HandoffBench writes the exact prompt and response audit beside the
+        temporary model image.  The normal adapter keeps that directory
+        ephemeral; this opt-in copy makes live integration tests inspectable
+        without changing formal-run retention behavior.
+        """
+        target_root = os.environ.get("HANDOFF_RECOVERY_PROMPT_AUDIT_DIR", "").strip()
+        if not target_root:
+            return
+        self._audit_counter += 1
+        target = Path(target_root).expanduser().resolve() / (
+            f"decision_{self._audit_counter:03d}_{scope}")
+        target.mkdir(parents=True, exist_ok=True)
+        for source in sorted(temporary_directory.glob("*_coordinates.json")):
+            shutil.copy2(source, target / source.name)
+        for source in sorted(temporary_directory.glob("*_transport.json")):
+            shutil.copy2(source, target / source.name)
 
     def validate_action(self, action, width, height, *, allow_done=True):
         return self._get_bindings().validate_action(action, width, height, allow_done=allow_done)
@@ -318,9 +342,15 @@ class CloudExecutor:
             raise TypeError("decide accepts only PublicFrame and LocalInstruction")
         if instruction.original_goal != self._original_goal:
             raise ValueError("The original goal cannot change within a task")
-        context = _current_context(instruction)
+        context = _current_context(
+            instruction,
+            include_constraints=self._configuration.include_recovery_constraints,
+            include_uncertain=self._configuration.include_recovery_uncertain,
+            include_completion_check=self.requires_completion_check,
+        )
         self._context, self._context_scope = apply_history_policy(
-            self._contexts, self._context, self._context_scope, instruction)
+            self._contexts, self._context, self._context_scope, instruction,
+            recovery_history_mode=self._configuration.recovery_history_mode)
         bindings = self._get_bindings()
         if not hasattr(bindings, "agent_class"):
             if not self._allow_legacy_path:
@@ -333,7 +363,7 @@ class CloudExecutor:
     def _decide_with_legacy_policy(self, frame, instruction, context, bindings):
         """Compatibility-only path for migration tests; never used by the registry."""
         api = bindings.api
-        goal = self._original_goal if context is None else self._original_goal + "\n\n" + context
+        goal = recovery_task_goal(self._original_goal, context)
         try:
             from PIL import Image
         except ImportError:
@@ -411,8 +441,18 @@ class CloudExecutor:
                 action = self._shared_agent.decide(
                     {"screenshot": str(path), "width": frame.width, "height": frame.height},
                     self._original_goal, deepcopy(self._context),
-                    recovery_context=self._context_payload(context) if context else None,
+                    recovery_context=context,
+                    include_recovery_constraints=self._configuration.include_recovery_constraints,
+                    allow_condition_updates=(context is not None
+                                              and context.get("scope") == "execution"
+                                              and (instruction.condition_updates_enabled
+                                                   if instruction.condition_updates_enabled is not None
+                                                   else instruction.completion_policy == "conditions")),
+                    allow_completion_check=(self.requires_completion_check
+                                             and context is not None
+                                             and context.get("scope") == "execution"),
                 )
+                self._persist_prompt_audit(Path(directory), instruction.scope)
         except CloudExecutorError:
             raise
         except Exception as exc:
@@ -421,30 +461,27 @@ class CloudExecutor:
                 category="request_error", cause_type=type(exc).__name__) from None
         if action is None:
             raise CloudExecutorError("Cloud Agent returned no valid action",
-                                     category="native_parse_error")
+                                     category="native_parse_error",
+                                     recoverable=self.provider in {"qwen35", "lfm25_vl"})
         self._context.append(deepcopy(action))
         return action
 
     @staticmethod
-    def _context_payload(context: str | None):
-        if not context:
-            return None
-        try:
-            guidance, payload = context.split("\n", 1)
-            parsed = json.loads(payload)
-            if isinstance(parsed, dict):
-                return {"guidance": guidance, **parsed}
-        except (ValueError, json.JSONDecodeError):
-            pass
-        return {"guidance": context}
+    def _context_payload(context: dict | None):
+        """Compatibility alias for callers inspecting the old helper."""
+        return deepcopy(context) if context is not None else None
 
 
 def make_cloud_executor(bench_path: str | Path, spec) -> CloudExecutor:
-    """Registry factory shared by the four provider names."""
+    """Registry factory shared by general screenshot model providers."""
     provider = spec.agent.strip().lower()
     total_timeout = None if provider == "qwen" else spec.total_timeout_seconds
     return CloudExecutor(bench_path, CloudExecutorConfiguration(
         provider=provider, api_key=spec.api_key, model=spec.model,
         base_url=spec.base_url, timeout_seconds=spec.timeout_seconds,
         total_timeout_seconds=total_timeout,
-        proxy_mode=spec.proxy_mode, max_output_tokens=spec.max_tokens))
+        proxy_mode=spec.proxy_mode, max_output_tokens=spec.max_tokens,
+        enable_completion_check=spec.enable_completion_check,
+        recovery_history_mode=spec.recovery_history_mode,
+        include_recovery_constraints=spec.include_recovery_constraints,
+        include_recovery_uncertain=spec.include_recovery_uncertain))

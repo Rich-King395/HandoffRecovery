@@ -8,8 +8,10 @@ import unittest
 from unittest.mock import Mock, patch
 import zlib
 
-from handoff_recovery.core.types import ConditionalAction, Handoff, LocalInstruction, PublicFrame, VerificationTask
-from handoff_recovery.executor.phonebuddy import PhoneBuddyConfiguration, PhoneBuddyExecutor
+from handoff_recovery.core.types import Handoff, LocalInstruction, PublicFrame, VerificationTask
+from handoff_recovery.executor.phonebuddy import (
+    PhoneBuddyConfiguration, PhoneBuddyExecutor,
+)
 
 
 def png_bytes():
@@ -51,6 +53,7 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
             parse_tool_call=Mock(return_value=(
                 {"name": "button_press", "arguments": {"type": "back"}}, "go back")),
             map_phonebuddy_action=Mock(return_value={"action": "back", "coords": []}),
+            validate_action=Mock(return_value={"action": "back", "coords": []}),
             history_entry=Mock(side_effect=self.history_entry),
         )
         self.response = SimpleNamespace(choices=[SimpleNamespace(
@@ -97,6 +100,42 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
             self.executor.decide(frame(1), instruction())
         self.assertEqual(len(self.build_calls[1][2]), 1)
         self.assertEqual(self.history_calls[0][1], "go back")
+        self.bindings.validate_action.assert_called()
+
+    def test_production_path_delegates_request_to_handoffbench_api(self):
+        self.bindings.request_action = Mock(return_value=
+            '<tool_call>{"name":"button_press","arguments":{"type":"back"}}</tool_call>')
+        executor = PhoneBuddyExecutor(
+            "/explicit/benchmark", PhoneBuddyConfiguration(api_key="private-test-key"))
+        executor.start_task("task-api", "Finish the file edit.")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
+                   return_value=self.bindings):
+            action = executor.decide(frame(), instruction("original"))
+        self.assertEqual(action["action"], "back")
+        self.bindings.request_action.assert_called_once()
+        request = self.bindings.request_action.call_args
+        self.assertEqual(request.args[1], "Finish the file edit.")
+        self.assertEqual(request.kwargs["history"], [])
+        self.assertIsNone(request.kwargs["recovery_context"])
+
+    def test_production_path_passes_structured_recovery_context(self):
+        self.bindings.request_action = Mock(return_value=
+            '<tool_call>{"name":"button_press","arguments":{"type":"back"}}</tool_call>')
+        executor = PhoneBuddyExecutor(
+            "/explicit/benchmark", PhoneBuddyConfiguration(api_key="private-test-key"))
+        executor.start_task("task-api-context", "Finish the file edit.")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
+                   return_value=self.bindings):
+            executor.decide(frame(), instruction("execution"))
+        context = self.bindings.request_action.call_args.kwargs["recovery_context"]
+        self.assertEqual(context["scope"], "execution")
+        self.assertIn("handoff", context)
+
+    def test_phonebuddy_descriptor_keeps_native_protocol_explicit(self):
+        descriptor = self.executor.descriptor
+        self.assertEqual(descriptor["native_protocol"], "phonebuddy_tool_call_v1")
+        self.assertEqual(descriptor["action_normalization"],
+                         "native_parser_then_handoffbench_mapper")
 
     def test_native_context_is_reset_when_scope_changes(self):
         with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
@@ -115,20 +154,28 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
             self.executor.decide(frame(1), instruction("original"))
             self.executor.decide(frame(2), instruction("execution"))
             self.executor.decide(frame(3), instruction("fallback", resume_original=True))
+        # Recovery starts isolated; fallback then restores the original
+        # snapshot with its two successful native actions.
         self.assertEqual([len(call[2]) for call in self.build_calls], [0, 1, 0, 2])
         prompt = self.client.chat.completions.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("resume_original_context", prompt)
-        self.assertIn("planner_unavailable_or_invalid", prompt)
+        self.assertEqual(prompt, "Finish the file edit.")
         self.assertEqual(self.executor._context_scope, "original")
 
     def test_execution_context_requires_self_check_before_done(self):
+        self.executor = PhoneBuddyExecutor(
+            "/explicit/benchmark",
+            PhoneBuddyConfiguration(api_key="private-test-key", enable_completion_check=True),
+            client_factory=self.factory,
+        )
+        self.executor.start_task("task-1", "Finish the file edit.")
         with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
                    return_value=self.bindings):
             self.executor.decide(frame(), instruction("execution"))
         prompt = self.client.chat.completions.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("check every completion_condition", prompt)
-        self.assertIn("prior action, thought, or pre-handoff history is not evidence", prompt)
-        self.assertIn("completion_check array", prompt)
+        self.assertIn("condition_updates to mark a condition [satisfied]", prompt)
+        self.assertIn("Return done only when every condition in Completion condition status is marked [satisfied]", prompt)
+        self.assertIn("Open the target and save the exact text", prompt)
+        self.assertIn("completion_check item", prompt)
 
     def test_completion_check_can_be_disabled_for_control_ab(self):
         configuration = PhoneBuddyConfiguration(
@@ -164,46 +211,17 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
         self.assertEqual(self.history_calls[0][0]["arguments"],
                          {"text": "done", "completion_check": check})
 
-    def test_execution_context_includes_structured_prior_progress(self):
+    def test_execution_context_does_not_include_prior_progress(self):
         local = LocalInstruction(
             "Finish the file edit.", (), "execution", handoff=Handoff(
                 "Set only the incorrect time", (), ("09:00 visible",)),
-            prior_progress={
-                "purpose": "orientation_only",
-                "reliability": "unverified",
-                "current_state_source": "latest_screenshot",
-                "attempt_summary": {
-                    "decision_count": 1,
-                    "action_types_attempted": ["tap"],
-                },
-                "interpretation_rule": (
-                    "These are attempted actions only. They do not prove that any action "
-                    "succeeded or describe the current UI state."
-                ),
-            })
+            )
         with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
                    return_value=self.bindings):
             self.executor.decide(frame(), local)
         prompt = self.client.chat.completions.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("prior_progress", prompt)
-        self.assertIn('"decision_count": 1', prompt)
-        self.assertIn('"action_types_attempted": ["tap"]', prompt)
-        self.assertIn("latest screenshot is authoritative", prompt)
-
-    def test_execution_prompt_includes_inspection_and_conditional_actions(self):
-        handoff = Handoff(
-            "Restore the requested setting.", (), ("The setting is correct.",),
-            ("Open the settings page and read the explicit value.",),
-            (ConditionalAction("The value is Light.", "Select Dark."),),
-        )
-        local = LocalInstruction("Finish the file edit.", (), "execution", handoff=handoff)
-        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
-                   return_value=self.bindings):
-            self.executor.decide(frame(), local)
-        prompt = self.client.chat.completions.create.call_args.kwargs["messages"][-1]["content"][-1]["text"]
-        self.assertIn("inspect_before_action", prompt)
-        self.assertIn("The value is Light.", prompt)
-        self.assertIn("Select Dark.", prompt)
+        self.assertNotIn("prior_progress", prompt)
+        self.assertIn("Set only the incorrect time", prompt)
 
     def test_configuration_rejects_invalid_model(self):
         with self.assertRaises(ValueError):
@@ -225,6 +243,26 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 self.executor.decide(frame(), instruction())
         self.assertEqual(caught.exception.category, "action_mapping_error")
+        self.assertIn("unsupported", str(caught.exception))
+
+    def test_recovery_forwards_flat_points_to_the_strict_native_mapper_once(self):
+        call = {"name": "click", "arguments": {"points": [500, 900]}}
+        self.bindings.parse_tool_call.return_value = (call, "click")
+        self.bindings.map_phonebuddy_action.side_effect = ValueError("native nested points required")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings", return_value=self.bindings):
+            with self.assertRaises(Exception) as caught:
+                self.executor.decide(frame(), instruction())
+        self.assertEqual(caught.exception.category, "action_mapping_error")
+        self.bindings.map_phonebuddy_action.assert_called_once_with(call, (2, 2))
+        self.assertEqual(self.executor._context, [])
+
+    def test_recovery_preserves_native_nested_phonebuddy_points(self):
+        call = {"name": "click", "arguments": {"points": [[500, 900]]}}
+        self.bindings.parse_tool_call.return_value = (call, "click")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings", return_value=self.bindings):
+            self.executor.decide(frame(), instruction())
+        self.bindings.map_phonebuddy_action.assert_called_once_with(call, (2, 2))
+        self.assertEqual(call["arguments"]["points"], [[500, 900]])
 
     def test_request_and_response_failures_have_distinct_categories(self):
         with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
@@ -242,6 +280,22 @@ class PhoneBuddyExecutorTests(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 self.executor.decide(frame(), instruction())
         self.assertEqual(caught.exception.category, "response_error")
+
+    def test_prompt_and_history_failures_have_distinct_categories(self):
+        self.bindings.api.build_messages.side_effect = ValueError("prompt")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
+                   return_value=self.bindings):
+            with self.assertRaises(Exception) as caught:
+                self.executor.decide(frame(), instruction())
+        self.assertEqual(caught.exception.category, "prompt_error")
+
+        self.setUp()
+        self.bindings.history_entry.side_effect = RuntimeError("history")
+        with patch("handoff_recovery.executor.phonebuddy.load_phonebuddy_bindings",
+                   return_value=self.bindings):
+            with self.assertRaises(Exception) as caught:
+                self.executor.decide(frame(), instruction())
+        self.assertEqual(caught.exception.category, "history_error")
 
 
 if __name__ == "__main__":

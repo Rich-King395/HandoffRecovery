@@ -55,9 +55,54 @@ class UIVoyagerExecutorTests(unittest.TestCase):
             action = executor.decide(frame(), instruction)
             executor.decide(frame(1), instruction)
         self.assertEqual(action["action"], "tap")
-        self.assertIn('"scope": "execution"', api.request_action.call_args_list[0].args[1])
+        self.assertIn("condition_updates to mark a condition [satisfied]",
+                      api.request_action.call_args_list[0].args[1])
         self.assertEqual(api.request_action.call_args_list[0].kwargs["history"], [])
         self.assertEqual(api.request_action.call_args_list[1].kwargs["history"], ["tap"])
+
+    def _executor_case(self, *, parse=None, map_action=None, history=None):
+        @dataclass
+        class UIVoyagerAPIConfiguration:
+            api_key: str
+            model: str
+            base_url: str
+            timeout_seconds: float = 120.0
+            max_tokens: int = 2048
+        api = SimpleNamespace(UIVoyagerConfiguration=UIVoyagerAPIConfiguration,
+                              request_action=Mock(return_value="native"))
+        bindings = SimpleNamespace(
+            api=api,
+            parse_tool_call=Mock(side_effect=parse) if isinstance(parse, BaseException)
+                else Mock(return_value=parse or {"name": "mobile_use", "arguments": {"action": "click", "coordinate": [500, 500]}}),
+            map_mobile_use_action=Mock(side_effect=map_action) if isinstance(map_action, BaseException)
+                else Mock(return_value=map_action or {"action": "tap", "coords": [1, 1]}),
+            native_action_description=Mock(side_effect=history) if isinstance(history, BaseException)
+                else Mock(return_value=history or "tap"),
+            validate_action=Mock(return_value={"action": "tap", "coords": [1, 1]}),
+        )
+        executor = UIVoyagerExecutor("/bench", UIVoyagerConfiguration())
+        executor.start_task("task", "Set the value")
+        return executor, bindings
+
+    def test_error_categories_are_distinct(self):
+        for field, error, expected in (
+            ("parse", ValueError("malformed"), "native_parse_error"),
+            ("map_action", ValueError("bad action"), "action_mapping_error"),
+            ("history", RuntimeError("history"), "history_error"),
+        ):
+            executor, bindings = self._executor_case(**{field: error})
+            with patch("handoff_recovery.executor.ui_voyager.load_ui_voyager_bindings", return_value=bindings):
+                with self.assertRaises(Exception) as caught:
+                    executor.decide(frame(), LocalInstruction("Set the value", (), "original"))
+            self.assertEqual(caught.exception.category, expected)
+
+    def test_request_error_is_distinct(self):
+        executor, bindings = self._executor_case()
+        bindings.api.request_action.side_effect = RuntimeError("transport")
+        with patch("handoff_recovery.executor.ui_voyager.load_ui_voyager_bindings", return_value=bindings):
+            with self.assertRaises(Exception) as caught:
+                executor.decide(frame(), LocalInstruction("Set the value", (), "original"))
+        self.assertEqual(caught.exception.category, "request_error")
 
 
 class HoloExecutorTests(unittest.TestCase):
@@ -115,6 +160,55 @@ class HoloExecutorTests(unittest.TestCase):
         self.assertEqual(action["action"], "tap")
         self.assertEqual(len(api.request_action.call_args_list[1].kwargs["history"]), 1)
         self.assertEqual(api.request_action.call_args_list[1].kwargs["history"][0]["assistant"]["tool_calls"][0]["function"], call)
+
+    def _executor_case(self, *, parse=None, map_action=None, validate=None):
+        image = SimpleNamespace(path="public.png")
+        @dataclass
+        class HoloAPIConfiguration:
+            api_key: str
+            model: str
+            base_url: str
+            timeout_seconds: float = 200.0
+            max_tokens: int = 2048
+        api = SimpleNamespace(
+            HoloConfiguration=HoloAPIConfiguration,
+            HISTORY_IMAGES=2, encode_screenshot=Mock(return_value=image),
+            request_action=Mock(return_value=SimpleNamespace(content="", reasoning="", tool_calls=[])),
+        )
+        parsed = parse if parse is not None else SimpleNamespace(
+            call={"name": "click", "arguments": {"element": "Save", "x": 500, "y": 500}},
+            content="", reasoning="")
+        bindings = SimpleNamespace(
+            api=api, parse_completion=Mock(side_effect=parsed) if isinstance(parsed, BaseException)
+                else Mock(return_value=parsed),
+            map_holo_action=Mock(side_effect=map_action) if isinstance(map_action, BaseException)
+                else Mock(return_value=map_action or {"action": "tap", "coords": [1, 1]}),
+            validate_action=Mock(side_effect=validate) if isinstance(validate, BaseException)
+                else Mock(return_value=validate or {"action": "tap", "coords": [1, 1]}),
+        )
+        executor = HoloExecutor("/bench", HoloConfiguration())
+        executor.start_task("task", "Save the value")
+        return executor, bindings
+
+    def test_error_categories_are_distinct(self):
+        for field, error, expected in (
+            ("parse", ValueError("malformed"), "native_parse_error"),
+            ("map_action", ValueError("bad action"), "action_mapping_error"),
+            ("validate", ValueError("invalid action"), "action_mapping_error"),
+        ):
+            executor, bindings = self._executor_case(**{field: error})
+            with patch("handoff_recovery.executor.holo.load_holo_bindings", return_value=bindings):
+                with self.assertRaises(Exception) as caught:
+                    executor.decide(frame(), LocalInstruction("Save the value", (), "original"))
+            self.assertEqual(caught.exception.category, expected)
+
+    def test_request_error_is_distinct(self):
+        executor, bindings = self._executor_case()
+        bindings.api.request_action.side_effect = RuntimeError("transport")
+        with patch("handoff_recovery.executor.holo.load_holo_bindings", return_value=bindings):
+            with self.assertRaises(Exception) as caught:
+                executor.decide(frame(), LocalInstruction("Save the value", (), "original"))
+        self.assertEqual(caught.exception.category, "request_error")
 
 
 if __name__ == "__main__":

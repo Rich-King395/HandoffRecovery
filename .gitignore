@@ -26,8 +26,7 @@ dist/
 .runtime/
 .cache/
 artifacts/
-results/*
-!results/README.md
+results/
 models/
 local-models/
 *.safetensors
@@ -36,3 +35,36 @@ local-models/
 *.pth
 *.apk
 *.log
+
+# Maintainer-only assistant instructions and host inventories.
+AGENTS.md
+AGENTS.override.md
+SKILL.md
+CLAUDE.md
+GEMINI.md
+HANDOFF_CODEX*
+LOCAL_EXPERIMENT_ENVIRONMENTS.md
+.agents/
+.codex/
+.claude/
+.cursor/
+
+# Local model downloads and private key containers.
+/models/
+/local-models/
+/weights/
+/checkpoints/
+*.gguf
+*.ckpt
+*.onnx
+*.h5
+*.p12
+*.pfx
+*.keystore
+*.jks
+
+# Local editor and pre-refactor copies
+*.bak
+*.bak.*
+*.orig
+*.rej

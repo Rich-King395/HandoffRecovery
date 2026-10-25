@@ -73,9 +73,48 @@ class CloudExecutorTests(unittest.TestCase):
         self.assertEqual(second, {"action": "tap", "coords": [1, 1]})
         self.assertEqual(self.api.request_action.call_count, 2)
         first_goal = self.api.request_action.call_args_list[0].args[1]
-        self.assertIn('"scope": "execution"', first_goal)
+        self.assertIn("Set the requested value.", first_goal)
+        self.assertIn("A user takeover occurred while the original task was being executed", first_goal)
+        self.assertIn('condition_id (c1, c2, ...), status="satisfied", and concise evidence',
+                      first_goal)
+        self.assertIn("Use an empty condition_updates array when no condition became satisfied",
+                      first_goal)
+        self.assertIn("Return done only when every condition in Completion condition status is marked [satisfied]", first_goal)
         self.assertEqual(self.api.request_action.call_args_list[0].kwargs["history"], [])
-        self.assertEqual(len(self.api.request_action.call_args_list[1].kwargs["history"]), 1)
+        self.assertEqual(self.api.request_action.call_args_list[1].kwargs["history"], [
+            {"action": "tap", "coords": [500, 500]},
+        ])
+
+    def test_condition_status_reaches_prompt_without_action_feedback(self):
+        instruction = LocalInstruction(
+            "Set the requested value.", (), "execution",
+            handoff=Handoff(
+                "Set the requested value.", (),
+                ("The value is visible", "The save indicator is visible"),
+            ),
+            condition_status=(
+                ("The value is visible", "satisfied"),
+                ("The save indicator is visible", "pending"),
+            ),
+            last_action_feedback={"action": "tap", "state_changed": False},
+        )
+        with patch("handoff_recovery.executor.cloud.load_cloud_bindings",
+                   return_value=self.bindings):
+            self.executor.decide(frame(), instruction)
+        goal = self.api.request_action.call_args.args[1]
+        self.assertNotIn("Recovery progress", goal)
+        self.assertNotIn("Confirmed:", goal)
+        self.assertNotIn("Uncertain:", goal)
+        self.assertNotIn("completion conditions:", goal)
+        self.assertIn("A user takeover occurred while the original task was being executed", goal)
+        self.assertIn('condition_id (c1, c2, ...), status="satisfied", and concise evidence',
+                      goal)
+        self.assertIn("Return done only when every condition in Completion condition status is marked [satisfied]", goal)
+        self.assertIn("[satisfied] The value is visible", goal)
+        self.assertIn("[pending] The save indicator is visible", goal)
+        self.assertNotIn("Last action feedback:", goal)
+        self.assertNotIn('"state_changed"', goal)
+        self.assertNotIn("Completion conditions / evidence to obtain:", goal)
 
     def test_fallback_restores_original_history(self):
         original = LocalInstruction("Set the requested value.", (), "original")
@@ -88,7 +127,8 @@ class CloudExecutorTests(unittest.TestCase):
         self.assertEqual(self.api.request_action.call_args_list[1].kwargs["history"], [
             {"action": "tap", "coords": [500, 500]},
         ])
-        self.assertIn("resume_original_context", self.api.request_action.call_args_list[1].args[1])
+        self.assertEqual(self.api.request_action.call_args_list[1].args[1],
+                         "Set the requested value.")
 
     def test_request_failure_is_classified_without_raw_error(self):
         self.api.request_action.side_effect = RuntimeError("private-key and image bytes")

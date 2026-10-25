@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "files": {
+    "tests/fixtures/.gitkeep": {
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "reasons": [
+        "fixture_provenance_review"
+      ],
+      "provenance": "Controlled offline regression input for synthetic Benchmark tasks; public UI layouts, artificial task records or test harness code. No maintainer experiment run, model reply or personal account data. Source manifests are adjacent where applicable."
+    }
+  }
+}

@@ -3,25 +3,29 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-import json
-import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Callable
 from urllib.parse import urlsplit
 
 from handoff_recovery.core.types import LocalInstruction, PublicFrame
-from handoff_recovery.core.protocols import apply_history_policy, history_policy_descriptor
+from handoff_recovery.core.protocols import (RecoveryContext, apply_history_policy,
+                                              DEFAULT_RECOVERY_HISTORY_MODE,
+                                              RECOVERY_HISTORY_MODES,
+                                              history_policy_descriptor, recovery_task_goal)
 from handoff_recovery.integrations.handoffbench import load_phonebuddy_bindings
+from .config import validate_finite_positive, validate_http_url, validate_positive_int
+from .condition_updates import PROTOCOL, FORMAT_SHA256, enabled, request_options, parse_native_response
 
 
 class PhoneBuddyExecutorError(RuntimeError):
     """One PhoneBuddy decision failed without an internal retry."""
 
-    def __init__(self, message: str, *, category: str, cause_type: str | None = None):
+    def __init__(self, message: str, *, category: str, cause_type: str | None = None, recoverable: bool = False):
         super().__init__(message)
         self.category = category
         self.cause_type = cause_type
+        self.recoverable = recoverable
 
 
 @dataclass(frozen=True)
@@ -32,33 +36,39 @@ class PhoneBuddyConfiguration:
     timeout_seconds: float = 180.0
     max_tokens: int = 8192
     prompt_path: Path | None = None
-    enable_completion_check: bool = True
+    # Completion checks are opt-in; callers can explicitly enable the A/B arm.
+    enable_completion_check: bool = False
+    configuration_source: str = "explicit_executor_spec"
+    recovery_history_mode: str = DEFAULT_RECOVERY_HISTORY_MODE
+    include_recovery_constraints: bool = False
+    include_recovery_uncertain: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_key, str) or not self.api_key.strip():
             raise ValueError("PhoneBuddy api_key must be nonempty; use EMPTY for a local endpoint")
         if not isinstance(self.model, str) or not self.model.strip() or any(c.isspace() for c in self.model):
             raise ValueError("PhoneBuddy model must be an identifier without whitespace")
-        try:
-            url = urlsplit(self.base_url)
-            valid = (isinstance(self.base_url, str) and url.scheme in {"http", "https"}
-                     and url.hostname and url.username is None and url.password is None
-                     and not url.query and not url.fragment
-                     and not any(c.isspace() for c in self.base_url))
-            url.port
-        except (AttributeError, TypeError, ValueError):
-            valid = False
-        if not valid:
-            raise ValueError("PhoneBuddy base_url must be HTTP(S) without credentials, query or fragment")
-        if (type(self.timeout_seconds) not in (int, float)
-                or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0):
-            raise ValueError("PhoneBuddy timeout_seconds must be finite and positive")
-        if type(self.max_tokens) is not int or self.max_tokens <= 0:
-            raise ValueError("PhoneBuddy max_tokens must be a positive integer")
+        validate_http_url(
+            self.base_url,
+            "PhoneBuddy base_url must be HTTP(S) without credentials, query or fragment",
+        )
+        validate_finite_positive(
+            self.timeout_seconds,
+            "PhoneBuddy timeout_seconds must be finite and positive",
+        )
+        validate_positive_int(self.max_tokens, "PhoneBuddy max_tokens must be a positive integer")
         if self.prompt_path is not None and not isinstance(self.prompt_path, Path):
             raise TypeError("prompt_path must be a pathlib.Path or None")
         if type(self.enable_completion_check) is not bool:
             raise TypeError("enable_completion_check must be a boolean")
+        if not isinstance(self.configuration_source, str) or not self.configuration_source.strip():
+            raise ValueError("PhoneBuddy configuration_source must be nonempty text")
+        if self.recovery_history_mode not in RECOVERY_HISTORY_MODES:
+            raise ValueError("PhoneBuddy recovery_history_mode must be isolated or original_snapshot")
+        if type(self.include_recovery_constraints) is not bool:
+            raise TypeError("PhoneBuddy include_recovery_constraints must be boolean")
+        if type(self.include_recovery_uncertain) is not bool:
+            raise TypeError("PhoneBuddy include_recovery_uncertain must be boolean")
 
 
 def _openai_class():
@@ -88,7 +98,9 @@ def _response_text(message):
     return content
 
 
-def _current_context(instruction: LocalInstruction, *, require_completion_check=True) -> str | None:
+def _current_context(instruction: LocalInstruction, *, require_completion_check=True,
+                     include_constraints: bool = False,
+                     include_uncertain: bool = False) -> RecoveryContext | None:
     scope = instruction.scope
     if scope not in {"original", "verification", "execution", "fallback"}:
         raise ValueError("Unknown local instruction scope")
@@ -102,77 +114,45 @@ def _current_context(instruction: LocalInstruction, *, require_completion_check=
         raise ValueError("Original and fallback scopes cannot contain recovery tasks")
     # Keep the pre-handoff GUI prompt identical to the baseline. Constraints
     # are injected only when a recovery scope is active.
-    if scope == "original":
+    if scope in {"original", "fallback"}:
         return None
-    payload = {"scope": scope, "public_constraints": list(instruction.public_constraints)}
-    if instruction.resume_original:
-        payload["resume_original_context"] = True
-        payload["resume_reason"] = instruction.resume_reason
+    payload = {"scope": scope,
+               "progress": {
+                   "confirmed": list(instruction.progress.confirmed),
+                   "uncertain": (list(instruction.progress.uncertain)
+                                 if include_uncertain else []),
+               }}
     if scope == "verification":
         task = instruction.verification
         payload["verification"] = {
             "objective": task.objective,
             "required_evidence": list(task.required_evidence),
-            "constraints": list(task.constraints),
+            "constraints": (list(task.constraints) if include_constraints else []),
+            "final_confirmation": task.final_confirmation,
         }
-        guidance = (
-            "Perform only the bounded verification task below. Native finish declares "
-            "verification completion, not completion of the original task."
-        )
     elif scope == "execution":
         handoff = instruction.handoff
         payload["handoff"] = {
             "remaining_objective": handoff.remaining_objective,
-            "preserve": list(handoff.preserve),
+            "preserve": (list(handoff.preserve) if include_constraints else []),
             "completion_conditions": list(handoff.completion_conditions),
-            "inspect_before_action": list(handoff.inspect_before_action),
-            "conditional_actions": [{"when": item.when, "then": item.then}
-                                    for item in handoff.conditional_actions],
         }
-        guidance = (
-            "Continue the original task using the complete remaining objective below. "
-            "The prior_progress entries are orientation only; the latest screenshot is "
-            "authoritative and you must re-check the visible state before acting. "
-            "All original requirements and public constraints still apply. There is no "
-            "further cloud planning or completion confirmation. Perform every listed "
-            "inspect_before_action check before changing task data, then select the "
-            "matching conditional action when one applies. Before returning done, "
-            "perform this self-check in order: (1) inspect the latest screen, (2) check "
-            "every completion_condition below yourself, and (3) confirm every preserve "
-            "constraint still holds. A prior action, thought, or pre-handoff history is not evidence "
-            "that a condition is satisfied; keep acting if any condition is not visible. "
-        )
         if require_completion_check:
-            guidance += (
-                "If and only if every condition is satisfied, return finish with an additional "
-                "completion_check array in the same tool call. Use one item per condition in order: "
-                "{condition_id: c1, status: satisfied, evidence: concise visible evidence}; "
-                "do not return finish without this complete array."
-            )
-    elif scope == "fallback":
-        guidance = (
-            "Resume the unchanged original task using the restored original native "
-            "conversation. The Planner did not provide reliable recovery guidance. "
-            "The latest screenshot is authoritative; earlier actions and thoughts are "
-            "historical context only and may be stale after user takeover. Reassess "
-            "the visible state before acting, preserve the original requirements, and "
-            "check the original task conditions yourself before returning done."
-        )
-    else:
-        guidance = "Continue the unchanged original task with these public constraints."
-    if instruction.prior_progress:
-        # The screenshot is emitted by the native HandoffBench prompt before
-        # this context. Keep history last and mark it as unverified metadata.
-        payload["prior_progress"] = instruction.prior_progress
-        guidance = (
-            "The latest screenshot is the authoritative current-state evidence. "
-            "The prior_progress entries below are only unverified action attempts; "
-            "they must not be treated as completed work or current UI facts.\n" + guidance
-        )
-    return guidance + "\n" + json.dumps(payload, ensure_ascii=False, allow_nan=False)
+            payload["completion_check_required"] = True
+    if instruction.completion_policy == "native" or instruction.condition_updates_enabled is not None:
+        payload["condition_status"] = [
+            {"condition": condition, "status": status}
+            for condition, status in instruction.condition_status]
+        payload["last_action_feedback"] = deepcopy(instruction.last_action_feedback)
+    if instruction.completion_policy == "native":
+        payload["completion_policy"] = "native"
+    if instruction.condition_updates_enabled is not None:
+        payload["condition_updates_enabled"] = instruction.condition_updates_enabled
+    return payload
 
 
 class PhoneBuddyExecutor:
+    condition_updates_protocol = PROTOCOL
     # The normalized HandoffRecovery action contract is stricter than the
     # unchanged upstream PhoneBuddy action protocol only during recovery.
     requires_completion_check = True
@@ -202,10 +182,21 @@ class PhoneBuddyExecutor:
             "model": self._configuration.model,
             "base_url_host": urlsplit(self._configuration.base_url).hostname or "",
             "protocol": "phonebuddy_finish",
+            "native_protocol": "phonebuddy_tool_call_v1",
+            "action_normalization": "native_parser_then_handoffbench_mapper",
+            "request_entrypoint": "handoffbench.api.request_action",
+            "response_extraction": "handoffbench.api._response_text",
+            "native_history_serialization": "handoffbench.agent.history_entry",
+            "configuration_source": self._configuration.configuration_source,
             "coordinate_space": "normalized_1000",
             "recovery_scopes": ["original", "verification", "execution", "fallback"],
             "requires_completion_check": self.requires_completion_check,
-            "history_policy": history_policy_descriptor(),
+            "recovery_constraints_in_prompt": self._configuration.include_recovery_constraints,
+            "recovery_uncertain_in_prompt": self._configuration.include_recovery_uncertain,
+            "history_policy": history_policy_descriptor(self._configuration.recovery_history_mode),
+            "history_owner": "handoff_recovery_host_policy",
+            "condition_updates_protocol": PROTOCOL,
+            "condition_updates_format_sha256": FORMAT_SHA256,
             "budget_semantics": "shared_total_v1_gui_decisions_only",
         }
 
@@ -232,9 +223,14 @@ class PhoneBuddyExecutor:
         if instruction.original_goal != self._original_goal:
             raise ValueError("The original goal cannot change within a task")
         context = _current_context(
-            instruction, require_completion_check=self.requires_completion_check)
+            instruction,
+            require_completion_check=self.requires_completion_check,
+            include_constraints=self._configuration.include_recovery_constraints,
+            include_uncertain=self._configuration.include_recovery_uncertain,
+        )
         self._context, self._context_scope = apply_history_policy(
-            self._contexts, self._context, self._context_scope, instruction)
+            self._contexts, self._context, self._context_scope, instruction,
+            recovery_history_mode=self._configuration.recovery_history_mode)
         if self._bindings is None:
             try:
                 self._bindings = load_phonebuddy_bindings(self._bench_path)
@@ -250,24 +246,47 @@ class PhoneBuddyExecutor:
         with TemporaryDirectory(prefix="handoff-recovery-phonebuddy-") as directory:
             path = Path(directory) / "public.png"
             path.write_bytes(frame.png)
-            try:
-                messages = api.build_messages(path, self._original_goal, list(self._context), prompt_path=prompt_path)
-            except Exception as exc:
-                raise PhoneBuddyExecutorError(
-                    "PhoneBuddy prompt construction failed",
-                    category="prompt_error", cause_type=type(exc).__name__) from None
-        if context is not None:
-            messages[-1]["content"].append({"type": "text", "text": context})
-        raw = self._request(messages, api)
+            request_goal = recovery_task_goal(self._original_goal, context)
+            if (context is not None and context.get("scope") == "execution"
+                    and self.requires_completion_check):
+                request_goal += (
+                    " Return finish only with one completion_check item for each listed "
+                    "condition, in the same order, using concise visible evidence."
+                )
+            if self._client_factory is None and callable(getattr(bindings, "request_action", None)):
+                # The production path is owned by HandoffBench. Recovery only
+                # supplies the scoped goal/context and native history.
+                try:
+                    raw = bindings.request_action(
+                        path, self._original_goal, configuration=self._configuration,
+                        history=list(self._context), recovery_context=context)
+                except Exception as exc:
+                    raise PhoneBuddyExecutorError(
+                        "PhoneBuddy request failed",
+                        category="request_error", cause_type=type(exc).__name__) from None
+            else:
+                # Kept only for injected offline test clients.
+                try:
+                    messages = api.build_messages(path, request_goal,
+                                                  list(self._context), prompt_path=prompt_path,
+                                                  **request_options(instruction))
+                except Exception as exc:
+                    raise PhoneBuddyExecutorError(
+                        "PhoneBuddy prompt construction failed",
+                        category="prompt_error", cause_type=type(exc).__name__) from None
+                raw = self._request(messages, api)
         try:
-            call, thought = bindings.parse_tool_call(raw)
+            (call, thought), raw, updates = parse_native_response(
+                raw, bindings.parse_tool_call, active=enabled(instruction))
         except Exception as exc:
             raise PhoneBuddyExecutorError(
                 "PhoneBuddy returned an invalid native tool call",
-                category="native_parse_error", cause_type=type(exc).__name__) from None
+                category="native_parse_error", cause_type=type(exc).__name__,
+                recoverable=isinstance(exc, (ValueError, OverflowError))) from None
         completion_check = None
         mapping_call = call
-        if call.get("name") == "finish" and "completion_check" in call.get("arguments", {}):
+        if (instruction.completion_policy != "native" and call.get("name") == "finish"
+                and "completion_check" in call.get("arguments", {})):
             mapping_call = deepcopy(call)
             mapping_args = dict(mapping_call["arguments"])
             completion_check = deepcopy(mapping_args.pop("completion_check"))
@@ -275,9 +294,21 @@ class PhoneBuddyExecutor:
         try:
             action = bindings.map_phonebuddy_action(mapping_call, (frame.width, frame.height))
         except Exception as exc:
+            reason = str(exc).strip()
+            suffix = f": {reason[:240]}" if reason else ""
             raise PhoneBuddyExecutorError(
-                "PhoneBuddy tool call could not be mapped to a public action",
-                category="action_mapping_error", cause_type=type(exc).__name__) from None
+                f"PhoneBuddy tool call could not be mapped to a public action{suffix}",
+                category="action_mapping_error", cause_type=type(exc).__name__,
+                recoverable=isinstance(exc, (ValueError, OverflowError))) from None
+        try:
+            bindings.validate_action(action, frame.width, frame.height, allow_done=True)
+        except Exception as exc:
+            reason = str(exc).strip()
+            suffix = f": {reason[:240]}" if reason else ""
+            raise PhoneBuddyExecutorError(
+                f"PhoneBuddy mapped action failed HandoffBench validation{suffix}",
+                category="action_mapping_error", cause_type=type(exc).__name__,
+                recoverable=isinstance(exc, (ValueError, OverflowError))) from None
         if thought:
             action["thought"] = thought
         if completion_check is not None:
@@ -288,6 +319,8 @@ class PhoneBuddyExecutor:
             raise PhoneBuddyExecutorError(
                 "PhoneBuddy native history could not be serialized",
                 category="history_error", cause_type=type(exc).__name__) from None
+        if updates is not None:
+            action["condition_updates"] = updates
         return action
 
     def _request(self, messages, api) -> str:

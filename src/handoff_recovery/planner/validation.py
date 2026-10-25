@@ -5,8 +5,10 @@ import json
 from typing import Any
 
 from handoff_recovery.core.types import (
-    ConditionalAction, Fact, Handoff, Plan, PlanRequest, SlimPlan, Unknown, VerificationTask,
+    Fact, Handoff, Plan, PlanRequest, ProgressSummary, SlimPlan, Unknown, VerificationTask,
+    sanitize_progress,
 )
+from .contracts import COMPLETION_STATUSES, PLANNER_DECISIONS, SLIM_PLAN_FIELDS
 
 
 class PlanValidationError(ValueError):
@@ -20,7 +22,6 @@ class PlanValidationError(ValueError):
         ("Missing, unexpected, or invalid object fields", "object_shape"),
         ("Expected an execution handoff object", "handoff_type"),
         ("Missing, unexpected, or invalid handoff fields", "handoff_shape"),
-        ("Expected a conditional action array", "conditional_actions_type"),
         ("Expected a nonempty text field", "text_field"),
         ("Expected a text array", "text_array"),
         ("Expected an array", "array_type"),
@@ -101,39 +102,31 @@ def _array(value: Any) -> list[Any]:
     return value
 
 
+def _progress(value: Any) -> ProgressSummary:
+    _fields(value, {"confirmed", "uncertain"})
+    return sanitize_progress({
+        "confirmed": _texts(value["confirmed"]),
+        "uncertain": _texts(value["uncertain"]),
+    })
+
+
 def _handoff(value: Any) -> Handoff:
     if not isinstance(value, dict):
         raise PlanValidationError("Expected an execution handoff object")
     required = {"remaining_objective", "preserve", "completion_conditions"}
-    optional = {"inspect_before_action", "conditional_actions"}
-    if set(value) - required - optional or not required <= set(value):
+    if set(value) - required or not required <= set(value):
         raise PlanValidationError("Missing, unexpected, or invalid handoff fields")
-    inspections = _texts(value.get("inspect_before_action", []))
-    conditional = value.get("conditional_actions", [])
-    if not isinstance(conditional, list):
-        raise PlanValidationError("Expected a conditional action array")
-    actions = []
-    for item in conditional:
-        item = _fields(item, {"when", "then"})
-        actions.append(( _text(item["when"]), _text(item["then"])))
     return Handoff(
         _text(value["remaining_objective"]),
         _texts(value["preserve"]),
         _texts(value["completion_conditions"], required=True),
-        inspections,
-        tuple(ConditionalAction(when, then) for when, then in actions),
     )
 
 
 def _parse(value: Any, request: PlanRequest) -> Plan:
-    allowed = {"decision", "reason", "facts", "unknowns", "verification", "handoff",
-               "use_prior_progress"}
-    required = {"decision", "reason", "facts", "unknowns", "verification", "handoff"}
-    if (not isinstance(value, dict) or not required <= set(value)
-            or not set(value) <= allowed):
-        raise PlanValidationError("Missing, unexpected, or invalid object fields")
+    _fields(value, {"decision", "reason", "facts", "unknowns", "verification", "handoff", "progress"})
     decision = _text(value["decision"])
-    if decision not in {"VERIFY", "EXECUTE", "FALLBACK"}:
+    if decision not in PLANNER_DECISIONS:
         raise PlanValidationError("Unsupported planner decision")
     reason = _text(value["reason"])
     frame_ids = {frame.evidence_id for frame in request.frames}
@@ -169,16 +162,27 @@ def _parse(value: Any, request: PlanRequest) -> Plan:
     if decision == "VERIFY":
         if value["handoff"] is not None:
             raise PlanValidationError("VERIFY cannot supply a final handoff")
+        if request.verification is not None:
+            raise PlanValidationError(
+                "A verification was already completed; Planner must choose EXECUTE or FALLBACK")
         if (request.verification_rounds_remaining < 1
                 or request.cloud_calls_remaining_after_this < 1
                 or request.decisions_remaining < 2):
             raise PlanValidationError("Insufficient remaining verification budget")
         if not any(item.blocks_handoff for item in unknowns):
             raise PlanValidationError("VERIFY must identify a blocking unknown")
-        item = _fields(value["verification"], {"objective", "required_evidence", "constraints"})
+        item = value["verification"]
+        if not isinstance(item, dict) or set(item) not in (
+                {"objective", "required_evidence", "constraints"},
+                {"objective", "required_evidence", "constraints", "final_confirmation"}):
+            raise PlanValidationError("Missing, unexpected, or invalid object fields")
+        final_confirmation = item.get("final_confirmation", False)
+        if type(final_confirmation) is not bool:
+            raise PlanValidationError("Missing, unexpected, or invalid object fields")
         verification = VerificationTask(
             _text(item["objective"]), _texts(item["required_evidence"], required=True),
             _texts(item["constraints"], required=True),
+            final_confirmation,
         )
     elif decision == "EXECUTE":
         if value["verification"] is not None:
@@ -188,38 +192,43 @@ def _parse(value: Any, request: PlanRequest) -> Plan:
         handoff = _handoff(value["handoff"])
     elif value["verification"] is not None or value["handoff"] is not None:
         raise PlanValidationError("FALLBACK cannot supply new instructions")
-    use_prior_progress = value.get("use_prior_progress", False)
-    if type(use_prior_progress) is not bool:
-        raise PlanValidationError("Missing, unexpected, or invalid object fields")
     return Plan(decision, reason, tuple(facts), tuple(unknowns), verification, handoff,
-                use_prior_progress)
+                _progress(value["progress"]))
 
 
 def _parse_slim(value: Any, request: PlanRequest) -> SlimPlan:
     """Parse the minimal cloud contract; evidence and branch semantics stay local."""
-    allowed = {"decision", "objective", "completion_conditions", "constraints",
-               "use_prior_progress"}
-    required = {"decision", "objective", "completion_conditions", "constraints"}
-    if (not isinstance(value, dict) or not required <= set(value)
-            or not set(value) <= allowed):
-        raise PlanValidationError("Missing, unexpected, or invalid object fields")
+    _fields(value, SLIM_PLAN_FIELDS)
     decision = _text(value["decision"])
-    if decision not in {"VERIFY", "EXECUTE", "FALLBACK"}:
+    if decision not in PLANNER_DECISIONS:
         raise PlanValidationError("Unsupported planner decision")
+    completion_status = _text(value["completion_status"])
+    if completion_status not in COMPLETION_STATUSES:
+        raise PlanValidationError("Unsupported completion status")
     objective = _text(value["objective"])
     completion = _texts(value["completion_conditions"])
-    constraints = _texts(value["constraints"])
     if decision in {"VERIFY", "EXECUTE"} and not completion:
         raise PlanValidationError("Expected a text array")
-    if decision == "VERIFY" and (
+    if completion_status == "COMPLETE" and decision != "VERIFY":
+        raise PlanValidationError("COMPLETE plans must choose VERIFY")
+    if completion_status == "UNVERIFIABLE" and decision == "EXECUTE":
+        raise PlanValidationError("UNVERIFIABLE plans cannot choose EXECUTE")
+    if request.verification_failed and completion_status == "COMPLETE":
+        raise PlanValidationError(
+            "A failed verification cannot be followed by COMPLETE")
+    if decision == "VERIFY" and request.verification is not None and completion_status != "COMPLETE":
+        raise PlanValidationError(
+            "A verification was already completed; Planner must choose EXECUTE or FALLBACK")
+    if decision == "VERIFY" and request.verification_failed:
+        raise PlanValidationError(
+            "A failed verification requires EXECUTE or FALLBACK")
+    if decision == "VERIFY" and request.verification is None and (
             request.verification_rounds_remaining < 1
             or request.cloud_calls_remaining_after_this < 1
             or request.decisions_remaining < 2):
-        raise PlanValidationError("Insufficient remaining verification budget")
-    use_prior_progress = value.get("use_prior_progress", False)
-    if type(use_prior_progress) is not bool:
-        raise PlanValidationError("Missing, unexpected, or invalid object fields")
-    return SlimPlan(decision, objective, completion, constraints, use_prior_progress)
+        raise PlanValidationError(
+            "Insufficient remaining verification budget")
+    return SlimPlan(decision, objective, completion, completion_status)
 
 
 def parse_plan(text: str, request: PlanRequest) -> Plan | SlimPlan:
@@ -233,9 +242,8 @@ def parse_plan(text: str, request: PlanRequest) -> Plan | SlimPlan:
         raise PlanValidationError("Planner output is not bounded text")
     value = strict_json(text)
     if (isinstance(value, dict)
-            and {"decision", "objective", "completion_conditions", "constraints"} <= set(value)
-            and set(value) <= {"decision", "objective", "completion_conditions", "constraints",
-                               "use_prior_progress"}):
+            and SLIM_PLAN_FIELDS <= set(value)
+            and set(value) <= SLIM_PLAN_FIELDS):
         return _parse_slim(value, request)
     return _parse(value, request)
 
@@ -254,10 +262,18 @@ def diagnose_plan_text(text: str) -> dict[str, Any]:
     result["root_type"] = type(value).__name__
     if not isinstance(value, dict):
         return result
-    expected = {"decision", "reason", "facts", "unknowns", "verification", "handoff"}
+    expected = {"decision", "reason", "facts", "unknowns", "verification", "handoff", "progress"}
     result["root_keys"] = sorted(value)
     result["root_missing"] = sorted(expected - set(value))
     result["root_extra"] = sorted(set(value) - expected)
+    progress = value.get("progress")
+    if isinstance(progress, dict) and set(progress) != {"confirmed", "uncertain"}:
+        result["nested_shape"] = {
+            "location": "progress", "keys": sorted(progress),
+            "missing": sorted({"confirmed", "uncertain"} - set(progress)),
+            "extra": sorted(set(progress) - {"confirmed", "uncertain"}),
+        }
+        return result
     for name, keys in (("facts", {"claim", "scope", "evidence_ids"}),
                        ("unknowns", {"question", "blocks_handoff", "reason"})):
         items = value.get(name)
@@ -272,23 +288,13 @@ def diagnose_plan_text(text: str) -> dict[str, Any]:
                     return result
     handoff = value.get("handoff")
     if isinstance(handoff, dict):
-        keys = {"remaining_objective", "preserve", "completion_conditions",
-                "inspect_before_action", "conditional_actions"}
+        keys = {"remaining_objective", "preserve", "completion_conditions"}
         required = {"remaining_objective", "preserve", "completion_conditions"}
         if (set(handoff) - keys) or not required <= set(handoff):
             result["nested_shape"] = {"location": "handoff", "keys": sorted(handoff),
                                        "missing": sorted(keys - set(handoff)),
                                        "extra": sorted(set(handoff) - keys)}
             return result
-        actions = handoff.get("conditional_actions")
-        if isinstance(actions, list):
-            for index, item in enumerate(actions):
-                if isinstance(item, dict) and set(item) != {"when", "then"}:
-                    result["nested_shape"] = {"location": f"handoff.conditional_actions[{index}]",
-                                               "keys": sorted(item),
-                                               "missing": sorted({"when", "then"} - set(item)),
-                                               "extra": sorted(set(item) - {"when", "then"})}
-                    return result
     return result
 
 
