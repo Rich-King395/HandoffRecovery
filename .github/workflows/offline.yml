@@ -21,7 +21,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install framework and model-client dependencies
-        run: python -m pip install -e '.[cloud-agents]'
+        # CLI tests also use the YAML reader supplied by HandoffBench in real runs.
+        run: python -m pip install -e '.[cloud-agents]' 'PyYAML==6.0.2'
       - name: Validate installed dependencies
         run: python -m pip check
       - name: Run standalone unit tests
